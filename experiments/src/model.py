@@ -3,6 +3,7 @@ from abc import ABC, abstractmethod
 from typing import Callable, Optional
 
 import jax
+import jax.nn
 import jax.numpy as jnp
 import numpy as np
 import numpyro
@@ -13,6 +14,7 @@ from typing_extensions import Self
 
 class BayesianNeuralNetwork(ABC):
     def __init__(self, beta: float = 1.0):
+        self.OBS_MODEL = None
         self.BETA = beta
 
     @abstractmethod
@@ -38,7 +40,7 @@ class BNNRegressor(BayesianNeuralNetwork):
                  obs_model: str | float = "loc_scale", prior_scale: float = 1.0, prior_type: str = "iid",
                  beta: float = 1.0):
         """ :param obs_model: float: precision of Gaussian / "loc_scale": predict both / "inv_gamma": Gamma
-            hyper-prior on precision
+            hyper-prior on precision / "classification" for softmax classifier on D_Y classes
         """
         super().__init__(beta)
         self._nonlin = nonlin
@@ -57,6 +59,8 @@ class BNNRegressor(BayesianNeuralNetwork):
         elif obs_model == "inv_gamma":
             self.OBS_MODEL = "inv_gamma"
             self._prior_prec_obs = dist.Gamma(3.0, 1.0)
+        elif obs_model == "classification":
+            self.OBS_MODEL = "classification"
         elif isinstance(obs_model, float):
             self.OBS_MODEL = "const_prec"
             # Abstract const parameter into dist; mask according to convention below, see guides
@@ -157,6 +161,14 @@ class BNNRegressor(BayesianNeuralNetwork):
             with numpyro.plate("data", N):
                 numpyro.sample("Y", dist.Normal(Y_mean, Y_scale).to_event(1), obs=Y)
 
+        elif self.OBS_MODEL == "classification":
+            assert pre_activ.shape[-1] >= 2
+            Y_p = numpyro.deterministic("Y_p", jax.nn.softmax(pre_activ, axis=1)[..., jnp.newaxis, :])
+
+            # observe data
+            with numpyro.plate("data", N):
+                numpyro.sample("Y", dist.Categorical(probs=Y_p).to_event(1), obs=Y)
+
         else:
             assert hasattr(self, "_prior_prec_obs")
             # we put a prior on the observation noise
@@ -173,7 +185,7 @@ class BNNRegressor(BayesianNeuralNetwork):
 
     @property
     def prior(self) -> tuple[dist.Distribution, Optional[dist.Distribution]]:
-        """ :returns prior on w and (prec_obs if exists) """
+        """ :returns prior on w and (prec_obs if exists)"""
         return self._prior_w, self._prior_prec_obs if hasattr(self, "_prior_prec_obs") else None
 
     def with_prior(self, prior_w: dist.Distribution, prior_prec_obs: Optional[dist.Distribution] = None) -> Self:

@@ -19,6 +19,7 @@ import jax
 import jax.numpy as jnp
 import jax.random as random
 import matplotlib.pyplot as plt
+import matplotlib.ticker
 import numpy as np
 import numpyro
 import numpyro.distributions as dist
@@ -54,20 +55,29 @@ class Experiment(ABC):
         assert self._predictions is not None
         X, Y = self._data.train
         X_test, _ = self._data.test
-        # compute mean prediction and confidence interval around median
-        Y_mean_pred, Y_pred = self._predictions["Y_mean"][..., 0], self._predictions["Y"][..., 0]
-        mean_means = jnp.mean(Y_mean_pred, axis=0)
-        mean_percentiles = np.percentile(Y_mean_pred, [5.0, 95.0], axis=0)
-        Y_percentiles = np.percentile(Y_pred, [5.0, 95.0], axis=0)
         # plotting
         if fig is None or ax is None:
             fig, ax = plt.subplots(figsize=(8, 6))
-        # plot training data
-        ax.plot(X[:, 1], Y[:, 0], "kx")
-        # plot predictions & quantiles
-        ax.plot(X_test[:, 1], mean_means, color="blue")
-        ax.fill_between(X_test[:, 1], *mean_percentiles, color="orange", alpha=0.5, label="90% CI on mean")
-        ax.fill_between(X_test[:, 1], *Y_percentiles, color="lightgreen", alpha=0.5, label="90% prediction")
+
+        if self._bnn.OBS_MODEL != "classification":
+            # compute mean prediction and confidence interval around median
+            Y_mean_pred, Y_pred = self._predictions["Y_mean"][..., 0], self._predictions["Y"][..., 0]
+            mean_means = jnp.mean(Y_mean_pred, axis=0)
+            mean_percentiles = np.percentile(Y_mean_pred, [5.0, 95.0], axis=0)
+            Y_percentiles = np.percentile(Y_pred, [5.0, 95.0], axis=0)
+            # plot training data
+            ax.plot(X[:, 1], Y[:, 0], "kx")
+            # plot predictions & quantiles
+            ax.plot(X_test[:, 1], mean_means, color="blue")
+            ax.fill_between(X_test[:, 1], *mean_percentiles, color="orange", alpha=0.5, label="90% CI on mean")
+            ax.fill_between(X_test[:, 1], *Y_percentiles, color="lightgreen", alpha=0.5, label="90% prediction")
+        else:
+            percentiles90 = jnp.percentile(self._predictions['Y_p'][:, :, 0, 0], q=jnp.array([5.0, 95.0]), axis=0)
+            percentiles50 = jnp.percentile(self._predictions['Y_p'][:, :, 0, 0], q=jnp.array([25.0, 75.0]), axis=0)
+            ax.plot(X_test[:, 1], self._predictions['Y_p'][:, :, 0, 0].mean(axis=0))
+            ax.fill_between(X_test[:, 1], *percentiles90, color='orange', alpha=0.3)
+            ax.fill_between(X_test[:, 1], *percentiles50, color='orange', alpha=0.3)
+            ax.xaxis.set_minor_locator(matplotlib.ticker.FixedLocator(X[:, 1]))
         return fig
 
     def run(self, rng_key: random.PRNGKey):
@@ -118,7 +128,7 @@ class BasicHMCExperiment(Experiment):
         assert self._samples is not None
         X_test, _ = self._data.test
         if not self._group_by_chain:
-            self._predictions = Predictive(self._bnn, self._samples, return_sites=['w', 'Y_mean', 'Y_std', 'Y'])(
+            self._predictions = Predictive(self._bnn, self._samples, return_sites=['w', 'Y_mean', 'Y_std', 'Y_p', 'Y'])(
                 rng_key_predict, X=X_test, Y=None)  # ['Y'][..., 0]
         else:
             def pred(rng_key, samples):
@@ -191,10 +201,14 @@ class EvalLoss:
 
 class BasicVIExperiment(SequentialExperimentBlock):
     def __init__(self, bnn: BayesianNeuralNetwork, data: Data, num_samples: int = 2_000,
-                 max_iter: int = 150_000):
+                 max_iter: int = 150_000, lr_schedule: optax.Schedule = optax.constant_schedule(-0.001),
+                 num_particles: int = 16, num_eval_particles: int = 128):
         super().__init__(bnn, data)
         self._num_samples = num_samples
         self._max_iter = max_iter
+        self._lr_schedule = lr_schedule  # Note should be negative!
+        self._num_particles = num_particles
+        self._num_eval_particles = num_eval_particles
         # Initialise state
         self._svi: Optional[SVI] = None
         self._guide: Optional[Callable] = None
@@ -213,17 +227,13 @@ class BasicVIExperiment(SequentialExperimentBlock):
         if self._svi is None:
             self._guide = self._get_guide()
             # Custom optimizer to prevent effect of exploding gradients (by tail ELBO estimates)
-            # Taken from phuijse.github.io/BLNNbook
-            lr_schedule = optax.constant_schedule(-0.0005)
-            # lr_schedule = optax.polynomial_schedule(
-            #     init_value=-0.01, end_value=-0.00001, power=1, transition_steps=5*VI_MAX_ITER)
             clipped_adam = optax.chain(optax.clip_by_global_norm(10.0),
                                        optax.scale_by_adam(),
-                                       optax.scale_by_schedule(lr_schedule))
+                                       optax.scale_by_schedule(self._lr_schedule))
             optimizer = clipped_adam  # Default taken from ashleve/lightning-hydra-template
-            train_loss = TraceMeanField_ELBO(num_particles=16)
+            train_loss = TraceMeanField_ELBO(num_particles=self._num_particles)
             self._svi = SVI(self._bnn, self._guide, optimizer, train_loss)
-        eval_loss = EvalLoss(num_particles=64)
+        eval_loss = EvalLoss(num_particles=self._num_eval_particles)
         rng_key_train, rng_key_eval, rng_key_init_loss = random.split(rng_key_train, 3)
 
         if self._saved_svi_state is None:
@@ -393,8 +403,10 @@ class BasicFullRankGaussianVIExperiment(BasicVIExperiment):
 
 class AutoLaplaceExperiment(BasicVIExperiment):
     def __init__(self, bnn: BayesianNeuralNetwork, data: Data, diag: bool = True, shrink: float = 25.0,
-                 num_samples: int = 2_000, max_iter: int = 150_000):
-        super().__init__(bnn, data, num_samples, max_iter)
+                 num_samples: int = 2_000, max_iter: int = 150_000,
+                 lr_schedule: optax.Schedule = optax.constant_schedule(-0.001),
+                 num_particles: int = 16, num_eval_particles: int = 128):
+        super().__init__(bnn, data, num_samples, max_iter, lr_schedule, num_particles, num_eval_particles)
         self._diag = diag
         self._shrink = shrink
 

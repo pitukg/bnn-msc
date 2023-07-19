@@ -1,5 +1,6 @@
 import abc
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import numpyro.distributions as dist
@@ -8,16 +9,16 @@ import numpyro.distributions as dist
 class Data(abc.ABC):
     @property
     @abc.abstractmethod
-    def train(self) -> tuple[jnp.ndarray, jnp.ndarray]:
+    def train(self) -> tuple[jax.Array, jax.Array]:
         raise NotImplementedError()
 
     @property
     @abc.abstractmethod
-    def test(self) -> tuple[jnp.ndarray, jnp.ndarray]:
+    def test(self) -> tuple[jax.Array, jax.Array]:
         raise NotImplementedError()
 
     # @abc.abstractmethod
-    def true_predictive(self, X: jnp.ndarray) -> dist.Distribution:
+    def true_predictive(self, X: jax.Array) -> dist.Distribution:
         raise NotImplementedError()
 
 
@@ -28,15 +29,15 @@ class DataSlice(Data):
         self._train_idx_slice: slice = train_idx_slice
 
     @property
-    def train(self) -> tuple[jnp.ndarray, jnp.ndarray]:
+    def train(self) -> tuple[jax.Array, jax.Array]:
         X, Y = self._data.train
         return X[self._train_idx_slice], Y[self._train_idx_slice]
 
     @property
-    def test(self) -> tuple[jnp.ndarray, jnp.ndarray]:
+    def test(self) -> tuple[jax.Array, jax.Array]:
         return self._data.test
 
-    def true_predictive(self, X: jnp.ndarray) -> dist.Distribution:
+    def true_predictive(self, X: jax.Array) -> dist.Distribution:
         return self._data.true_predictive(X)
 
 
@@ -46,15 +47,15 @@ class ReverseData(Data):
         self._data = data
 
     @property
-    def train(self) -> tuple[jnp.ndarray, jnp.ndarray]:
+    def train(self) -> tuple[jax.Array, jax.Array]:
         X, Y = self._data.train
         return X[::-1, ...], Y[::-1, ...]
 
     @property
-    def test(self) -> tuple[jnp.ndarray, jnp.ndarray]:
+    def test(self) -> tuple[jax.Array, jax.Array]:
         return self._data.test
 
-    def true_predictive(self, X: jnp.ndarray) -> dist.Distribution:
+    def true_predictive(self, X: jax.Array) -> dist.Distribution:
         return self._data.true_predictive(X)
 
 
@@ -68,15 +69,15 @@ class PermutedData(Data):
         self._perm = perm
 
     @property
-    def train(self) -> tuple[jnp.ndarray, jnp.ndarray]:
+    def train(self) -> tuple[jax.Array, jax.Array]:
         X, Y = self._data.train
         return X[self._perm], Y[self._perm]
 
     @property
-    def test(self) -> tuple[jnp.ndarray, jnp.ndarray]:
+    def test(self) -> tuple[jax.Array, jax.Array]:
         return self._data.test
 
-    def true_predictive(self, X: jnp.ndarray) -> dist.Distribution:
+    def true_predictive(self, X: jax.Array) -> dist.Distribution:
         return self._data.true_predictive(X)
 
 
@@ -118,5 +119,27 @@ class ToyData1(Data):
     def test(self):
         return self._X_test, self._Y_test
 
-    def true_predictive(self, X: jnp.ndarray) -> dist.Distribution:
+    def true_predictive(self, X: jax.Array) -> dist.Distribution:
+        raise NotImplementedError()
+
+
+class Sign(Data):
+    def __init__(self, data: Data):
+        self._data = data
+
+    @property
+    def train(self) -> tuple[jax.Array, jax.Array]:
+        X, y = self._data.train
+        # y_sign = jnp.where(y > 0, jnp.array([[1., 0.]]), jnp.array([[0., 1.]]))
+        y_sign = (y > 0).astype(jnp.int32)
+        return X, y_sign
+
+    @property
+    def test(self) -> tuple[jax.Array, jax.Array]:
+        X_test, y_test = self._data.test
+        # y_sign = jnp.where(y_test > 0, jnp.array([[1., 0.]]), jnp.array([[0., 1.]]))
+        y_sign = (y_test > 0).astype(jnp.int32) if y_test is not None else None
+        return X_test, y_sign
+
+    def true_predictive(self, X: jax.Array) -> dist.Distribution:
         raise NotImplementedError()
