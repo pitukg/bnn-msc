@@ -4,7 +4,8 @@ __all__ = [
     "AutoMeanFieldNormalVIExperiment",
     "BasicMeanFieldGaussianVIExperiment",
     "BasicFullRankGaussianVIExperiment",
-    "AutoLaplaceExperiment",
+    "AutoFullRankLaplaceExperiment",
+    "AutoDiagonalLaplaceExperiment",
     "SequentialExperiment",
     "ExperimentWithLastBlockReplaced",
 ]
@@ -12,6 +13,7 @@ __all__ = [
 import functools
 import os
 import time
+import warnings
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Optional, Type
 
@@ -402,24 +404,92 @@ class BasicFullRankGaussianVIExperiment(BasicVIExperiment):
         return w_posterior, prec_obs_posterior
 
 
-class AutoLaplaceExperiment(BasicVIExperiment):
-    def __init__(self, bnn: BayesianNeuralNetwork, data: Data, diag: bool = True, shrink: float = 25.0,
-                 num_samples: int = 2_000, max_iter: int = 150_000,
-                 lr_schedule: optax.Schedule = optax.constant_schedule(-0.001),
+class AutoFullRankLaplaceExperiment(BasicVIExperiment):
+    def __init__(self, bnn: BayesianNeuralNetwork, data: Data, shrink: float = 25.0, num_samples: int = 2_000,
+                 max_iter: int = 150_000, lr_schedule: optax.Schedule = optax.constant_schedule(-0.001),
                  num_particles: int = 16, num_eval_particles: int = 128):
         super().__init__(bnn, data, num_samples, max_iter, lr_schedule, num_particles, num_eval_particles)
-        self._diag = diag
         self._shrink = shrink
 
     def _get_guide(self) -> Callable:
-        if not self._diag:
-            hessian_fn = lambda f, x: jax.hessian(f)(x) + jnp.eye(x.shape[-1]) * self._shrink
-        else:
-            hessian_fn = lambda f, x: jnp.diag(jnp.diag(jax.hessian(f)(x))) + jnp.eye(x.shape[-1]) * self._shrink
-
         self._guide = autoguide.AutoLaplaceApproximation(
             self._bnn, init_loc_fn=functools.partial(numpyro.infer.init_to_uniform, radius=1.2),
-            hessian_fn=hessian_fn
+            hessian_fn=lambda f, x: jax.hessian(f)(x) + jnp.eye(x.shape[-1]) * self._shrink
+        )
+        return self._guide
+
+    @property
+    def posterior(self) -> tuple[dist.Distribution, Optional[dist.Distribution]]:
+        return self._guide.get_posterior(self._params), None
+
+    def make_predictions(self, rng_key_predict: random.PRNGKey):
+        assert self._params is not None and self._guide is not None
+        X_test, _ = self._data.test
+        posterior = self._guide.get_posterior(self._params)
+        samples = posterior.sample(rng_key_predict, sample_shape=(self._num_samples,))
+        predictive = Predictive(model=self._bnn, posterior_samples={'w': samples})
+        self._predictions = predictive(rng_key_predict, X=X_test, Y=None)  # ['Y'][..., 0]
+
+
+class AutoDiagonalLaplaceApproximation(autoguide.AutoLaplaceApproximation):
+    def __init__(
+            self,
+            model,
+            *,
+            prefix="auto",
+            init_loc_fn=autoguide.init_to_uniform,
+            create_plates=None,
+            hessian_diag_fn=None,
+    ):
+        super().__init__(
+            model, prefix=prefix, init_loc_fn=init_loc_fn, create_plates=create_plates
+        )
+        self._hessian_diag_fn = (
+            hessian_diag_fn if hessian_diag_fn is not None else (
+                lambda f, x: optax.hessian_diag(lambda params, _, __: f(params), x, None, None))
+        )
+
+    def get_transform(self, params):
+        def loss_fn(z):
+            params1 = params.copy()
+            params1["{}_loc".format(self.prefix)] = z
+            return self._loss_fn(params1)
+
+        loc = params["{}_loc".format(self.prefix)]
+        precision = self._hessian_diag_fn(loss_fn, loc)
+        scale = 1. / jnp.sqrt(precision)
+        if numpyro.util.not_jax_tracer(scale):
+            if np.any(np.isnan(scale)):
+                warnings.warn(
+                    "Hessian of log posterior at the MAP point is singular. Posterior"
+                    " samples from AutoLaplaceApproxmiation will be constant (equal to"
+                    " the MAP point). Please consider using an AutoNormal guide.",
+                    stacklevel=numpyro.util.find_stack_level(),
+                )
+        scale = jnp.where(jnp.isnan(scale), 0.0, scale)
+        return dist.transforms.AffineTransform(loc, scale)
+
+    def get_posterior(self, params):
+        """
+        Returns a multivariate Normal posterior distribution.
+        """
+        transform = self.get_transform(params)
+        return dist.Normal(transform.loc, scale=transform.scale).to_event(1)
+
+
+class AutoDiagonalLaplaceExperiment(BasicVIExperiment):
+    def __init__(self, bnn: BayesianNeuralNetwork, data: Data, shrink: float = 25.0, num_samples: int = 2_000,
+                 max_iter: int = 150_000, lr_schedule: optax.Schedule = optax.constant_schedule(-0.001),
+                 num_particles: int = 16, num_eval_particles: int = 128):
+        super().__init__(bnn, data, num_samples, max_iter, lr_schedule, num_particles, num_eval_particles)
+        self._shrink = shrink
+
+    def _get_guide(self) -> Callable:
+        self._guide = AutoDiagonalLaplaceApproximation(
+            self._bnn, init_loc_fn=functools.partial(numpyro.infer.init_to_uniform, radius=1.2),
+            # hessian_diag_fn=lambda f, x: jnp.diag(jax.hessian(f)(x)) + jnp.full((x.shape[-1],), self._shrink),
+            hessian_diag_fn=lambda f, x: optax.fisher_diag(lambda params, _, __: f(params), x, None, None) +
+                                         jnp.full((x.shape[-1],), self._shrink),
         )
         return self._guide
 
