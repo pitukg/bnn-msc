@@ -89,27 +89,41 @@ class ToyData1(Data):
         self.sigma_obs = sigma_obs
         D_Y = 1  # create 1d outputs
         np.random.seed(0)
+        self.W = 0.5 * np.random.randn(D_X)
         X = jnp.concatenate((jnp.linspace(-1, -0.4, train_size // 2),
                              jnp.linspace(0.4, 1, train_size - (train_size // 2))))
-        X = jnp.power(X[:, np.newaxis], jnp.arange(D_X))  # XXX ?bias included in model
-        W = 0.5 * np.random.randn(D_X)
-        # y = w0 + w1*x + w2*x**2 + 1/2 (1/2+x)**2 * sin(4x)
-        Y = jnp.dot(X, W) + 0.5 * jnp.power(0.5 + X[:, 1], 2.0) * jnp.sin(4.0 * X[:, 1])
-        Y += sigma_obs * np.random.randn(train_size)
-        Y = Y[:, np.newaxis]
-        Y -= jnp.mean(Y)
-        Y /= jnp.std(Y)
+        X = self._feature_expand(X)
+        Y = self._get_unscaled_mean(X)
+        Y += sigma_obs * np.random.randn(train_size, D_Y)
+        self._sub_mean = jnp.mean(Y)
+        self._div_std = jnp.std(Y)
+        Y = self._scale(Y)
 
         assert X.shape == (train_size, D_X)
         assert Y.shape == (train_size, D_Y)
 
         X_test = jnp.linspace(-1.7, 1.7, test_size)
-        X_test = jnp.power(X_test[:, np.newaxis], jnp.arange(D_X))
+        X_test = self._feature_expand(X_test)
 
         self._X = X
         self._Y = Y
         self._X_test = X_test
         self._Y_test = None
+
+    def _feature_expand(self, X: jax.Array):
+        return jnp.power(X[:, np.newaxis], jnp.arange(self.D_X))  # XXX ?bias included in model
+
+    def _get_unscaled_mean(self, X: jax.Array):
+        # X should be feature-expanded already
+        # y = w0 + w1*x + w2*x**2 + 1/2 (1/2+x)**2 * sin(4x)
+        Y = jnp.dot(X, self.W) + 0.5 * jnp.power(0.5 + X[:, 1], 2.0) * jnp.sin(4.0 * X[:, 1])
+        Y = Y[:, np.newaxis]
+        return Y
+
+    def _scale(self, Y: jax.Array):
+        Y -= self._sub_mean
+        Y /= self._div_std
+        return Y
 
     @property
     def train(self):
@@ -120,7 +134,11 @@ class ToyData1(Data):
         return self._X_test, self._Y_test
 
     def true_predictive(self, X: jax.Array) -> dist.Distribution:
-        raise NotImplementedError()
+        X = self._feature_expand(X)
+        Y_unscaled = self._get_unscaled_mean(X)
+        Y = self._scale(Y_unscaled)
+        scaled_sigma_obs = self.sigma_obs / self._div_std
+        return dist.Normal(Y, scale=scaled_sigma_obs)
 
 
 class Sign(Data):
@@ -142,4 +160,6 @@ class Sign(Data):
         return X_test, y_sign
 
     def true_predictive(self, X: jax.Array) -> dist.Distribution:
-        raise NotImplementedError()
+        underlying_pred = self._data.true_predictive(X)
+        probs = 1. - underlying_pred.cdf(0.)
+        return dist.Bernoulli(probs=probs)

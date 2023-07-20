@@ -72,11 +72,12 @@ class Experiment(ABC):
             ax.fill_between(X_test[:, 1], *mean_percentiles, color="orange", alpha=0.5, label="90% CI on mean")
             ax.fill_between(X_test[:, 1], *Y_percentiles, color="lightgreen", alpha=0.5, label="90% prediction")
         else:
-            percentiles90 = jnp.percentile(self._predictions['Y_p'][:, :, 0, 0], q=jnp.array([5.0, 95.0]), axis=0)
-            percentiles50 = jnp.percentile(self._predictions['Y_p'][:, :, 0, 0], q=jnp.array([25.0, 75.0]), axis=0)
-            ax.plot(X_test[:, 1], self._predictions['Y_p'][:, :, 0, 0].mean(axis=0))
+            percentiles90 = jnp.percentile(self._predictions['Y_p'][:, :, 0, 1], q=jnp.array([5.0, 95.0]), axis=0)
+            percentiles50 = jnp.percentile(self._predictions['Y_p'][:, :, 0, 1], q=jnp.array([25.0, 75.0]), axis=0)
+            ax.plot(X_test[:, 1], self._predictions['Y_p'][:, :, 0, 1].mean(axis=0))
             ax.fill_between(X_test[:, 1], *percentiles90, color='orange', alpha=0.3)
             ax.fill_between(X_test[:, 1], *percentiles50, color='orange', alpha=0.3)
+            ax.plot(X_test[:, 1], self._data.true_predictive(X_test[:, 1]).mean, linestyle=':', color="black")
             ax.xaxis.set_minor_locator(matplotlib.ticker.FixedLocator(X[:, 1]))
         return fig
 
