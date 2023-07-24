@@ -102,7 +102,7 @@ class ToyData1(Data):
         assert X.shape == (train_size, D_X)
         assert Y.shape == (train_size, D_Y)
 
-        X_test = jnp.linspace(-1.7, 1.7, test_size)
+        X_test = jnp.linspace(-3., 3., test_size)
         X_test = self._feature_expand(X_test)
 
         self._X = X

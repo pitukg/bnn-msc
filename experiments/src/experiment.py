@@ -108,24 +108,37 @@ class BasicHMCExperiment(Experiment):
         self._num_chains = num_chains
         self._group_by_chain = group_by_chain
         # Initialise state
-        self._samples: Optional[dict] = None
+        self._mcmc = None
+        samples_init_shape = (0, self._bnn.get_weight_dim(),) if not self._group_by_chain else \
+            (num_chains, 0, self._bnn.get_weight_dim(),)
+        self._samples: dict = dict(w=jnp.empty(samples_init_shape))
 
     def train(self, rng_key_train: random.PRNGKey, progress_bar: bool = True):
         start = time.time()
         X, Y = self._data.train
-        kernel = NUTS(self._bnn)
-        mcmc = MCMC(
-            kernel,
-            num_warmup=self._num_warmup,
-            num_samples=self._num_samples,
-            num_chains=self._num_chains,
-            chain_method="vectorized",
-            progress_bar=False if not progress_bar or "NUMPYRO_SPHINXBUILD" in os.environ else True,
+        if self._mcmc is None:
+            kernel = NUTS(self._bnn)
+            self._mcmc = MCMC(
+                kernel,
+                num_warmup=self._num_warmup,
+                num_samples=self._num_samples,
+                num_chains=self._num_chains,
+                chain_method="vectorized",
+                progress_bar=False if not progress_bar or "NUMPYRO_SPHINXBUILD" in os.environ else True,
+            )
+        else:
+            self._mcmc.progress_bar = progress_bar
+            if self._mcmc.post_warmup_state is not None:
+                rng_key_train = self._mcmc.post_warmup_state.rng_key
+        self._mcmc.run(rng_key_train, X, Y)
+        if progress_bar:
+            # mcmc.print_summary()
+            print("\nMCMC elapsed time:", time.time() - start)
+        self._samples['w'] = jnp.concatenate(
+            (self._samples['w'], self._mcmc.get_samples(group_by_chain=self._group_by_chain)['w']),
+            axis=0 if not self._group_by_chain else 1
         )
-        mcmc.run(rng_key_train, X, Y)
-        # mcmc.print_summary()
-        print("\nMCMC elapsed time:", time.time() - start)
-        self._samples = mcmc.get_samples(group_by_chain=self._group_by_chain)
+        self._mcmc.post_warmup_state = self._mcmc.last_state
 
     def make_predictions(self, rng_key_predict: random.PRNGKey):
         assert self._samples is not None
@@ -360,7 +373,7 @@ class AutoMeanFieldNormalVIExperiment(BasicVIExperiment):
 
 class AutoDeltaVIExperiment(BasicVIExperiment):
     def _get_guide(self) -> Callable:
-        return autoguide.AutoDelta(self._bnn, init_loc_fn=numpyro.infer.init_to_sample)
+        return autoguide.AutoDelta(self._bnn, init_loc_fn=init_loc_fn)
 
     @property
     def posterior(self) -> tuple[dist.Distribution, dist.Distribution]:
@@ -413,7 +426,7 @@ class AutoFullRankLaplaceExperiment(BasicVIExperiment):
 
     def _get_guide(self) -> Callable:
         self._guide = autoguide.AutoLaplaceApproximation(
-            self._bnn, init_loc_fn=functools.partial(numpyro.infer.init_to_uniform, radius=1.2),
+            self._bnn, init_loc_fn=init_loc_fn,
             hessian_fn=lambda f, x: jax.hessian(f)(x) + jnp.eye(x.shape[-1]) * self._shrink
         )
         return self._guide
@@ -471,10 +484,13 @@ class AutoDiagonalLaplaceApproximation(autoguide.AutoLaplaceApproximation):
 
     def get_posterior(self, params):
         """
-        Returns a multivariate Normal posterior distribution.
+        Returns an isotropic Normal posterior distribution.
         """
         transform = self.get_transform(params)
         return dist.Normal(transform.loc, scale=transform.scale).to_event(1)
+
+
+init_loc_fn = functools.partial(numpyro.infer.init_to_uniform, radius=5.)
 
 
 class AutoDiagonalLaplaceExperiment(BasicVIExperiment):
@@ -483,25 +499,50 @@ class AutoDiagonalLaplaceExperiment(BasicVIExperiment):
                  num_particles: int = 16, num_eval_particles: int = 128):
         super().__init__(bnn, data, num_samples, max_iter, lr_schedule, num_particles, num_eval_particles)
         self._shrink = shrink
+        self._posterior = None
 
     def _get_guide(self) -> Callable:
-        self._guide = AutoDiagonalLaplaceApproximation(
-            self._bnn, init_loc_fn=functools.partial(numpyro.infer.init_to_uniform, radius=1.2),
-            # hessian_diag_fn=lambda f, x: jnp.diag(jax.hessian(f)(x)) + jnp.full((x.shape[-1],), self._shrink),
-            hessian_diag_fn=lambda f, x: optax.fisher_diag(lambda params, _, __: f(params), x, None, None) +
-                                         jnp.full((x.shape[-1],), self._shrink),
-        )
+        # self._guide = AutoDiagonalLaplaceApproximation(
+        #     self._bnn, init_loc_fn=functools.partial(numpyro.infer.init_to_uniform, radius=1.2),
+        #     hessian_diag_fn=lambda f, x: jnp.diag(jax.hessian(f)(x)) + jnp.full((x.shape[-1],), self._shrink),
+        #     # hessian_diag_fn=lambda f, x: optax.fisher_diag(lambda params, _, __: f(params), x, None, None) +
+        #     #                              jnp.full((x.shape[-1],), self._shrink),
+        # )
+        self._guide = autoguide.AutoDelta(self._bnn, init_loc_fn=init_loc_fn)
         return self._guide
 
     @property
     def posterior(self) -> tuple[dist.Distribution, Optional[dist.Distribution]]:
-        return self._guide.get_posterior(self._params), None
+        return self._posterior, None
+
+    def _calculate_curvature(self):
+        loss = TraceMeanField_ELBO(num_particles=1)
+        rng_key = random.PRNGKey(0)
+
+        def negative_loglik(params, inputs, targets):
+            return loss.loss(rng_key, params, self._bnn, self._guide, X=inputs, Y=targets)
+
+        X, Y = self._data.train
+        precision = optax.fisher_diag(negative_loglik, self._params, X, Y)
+        precision += self._shrink
+        scale = 1. / jnp.sqrt(precision)
+        if numpyro.util.not_jax_tracer(scale):
+            if np.any(np.isnan(scale)):
+                warnings.warn(
+                    "Hessian of log posterior at the MAP point is singular. Posterior"
+                    " samples from AutoLaplaceApproxmiation will be constant (equal to"
+                    " the MAP point). Please consider using an AutoNormal guide.",
+                    stacklevel=numpyro.util.find_stack_level(),
+                )
+        scale = jnp.where(jnp.isnan(scale), 0.0, scale)
+        loc = self._params["w_auto_loc"]
+        self._posterior = dist.Normal(loc, scale)
 
     def make_predictions(self, rng_key_predict: random.PRNGKey):
         assert self._params is not None and self._guide is not None
+        self._calculate_curvature()
         X_test, _ = self._data.test
-        posterior = self._guide.get_posterior(self._params)
-        samples = posterior.sample(rng_key_predict, sample_shape=(self._num_samples,))
+        samples = self._posterior.sample(rng_key_predict, sample_shape=(self._num_samples,))
         predictive = Predictive(model=self._bnn, posterior_samples={'w': samples})
         self._predictions = predictive(rng_key_predict, X=X_test, Y=None)  # ['Y'][..., 0]
 
