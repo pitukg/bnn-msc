@@ -144,7 +144,7 @@ class BasicHMCExperiment(Experiment):
         assert self._samples is not None
         X_test, _ = self._data.test
         if not self._group_by_chain:
-            self._predictions = Predictive(self._bnn, self._samples, return_sites=['w', 'Y_mean', 'Y_std', 'Y_p', 'Y'])(
+            self._predictions = Predictive(self._bnn, self._samples, return_sites=['Y_mean', 'Y_std', 'Y_p', 'Y'])(
                 rng_key_predict, X=X_test, Y=None)  # ['Y'][..., 0]
         else:
             def pred(rng_key, samples):
