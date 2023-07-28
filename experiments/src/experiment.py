@@ -6,8 +6,10 @@ __all__ = [
     "BasicFullRankGaussianVIExperiment",
     "AutoFullRankLaplaceExperiment",
     "AutoDiagonalLaplaceExperiment",
+    "SWAGExperiment",
     "SequentialExperiment",
     "ExperimentWithLastBlockReplaced",
+    "init_loc_fn",
 ]
 
 import functools
@@ -26,6 +28,7 @@ import numpy as np
 import numpyro
 import numpyro.distributions as dist
 import optax
+import optax_swag
 import tqdm
 from jax import lax, vmap
 from numpyro import handlers
@@ -203,7 +206,7 @@ class EvalLoss:
 
         if self.num_particles == 1:
             elbo_lik, elbo_kl = single_particle_elbo(rng_key)
-            return {"elbo_lik": elbo_lik, "elbo_kl": elbo_kl}
+            return {"elbo_lik": elbo_lik, "elbo_kl": elbo_kl, "loss": -elbo_lik + elbo_kl}
         else:
             rng_keys = random.split(rng_key, self.num_particles)
             elbo_liks, elbo_kls = vmap(single_particle_elbo)(rng_keys)
@@ -490,7 +493,7 @@ class AutoDiagonalLaplaceApproximation(autoguide.AutoLaplaceApproximation):
         return dist.Normal(transform.loc, scale=transform.scale).to_event(1)
 
 
-init_loc_fn = functools.partial(numpyro.infer.init_to_uniform, radius=5.)
+init_loc_fn = numpyro.infer.init_to_sample
 
 
 class AutoDiagonalLaplaceExperiment(BasicVIExperiment):
@@ -545,6 +548,43 @@ class AutoDiagonalLaplaceExperiment(BasicVIExperiment):
         samples = self._posterior.sample(rng_key_predict, sample_shape=(self._num_samples,))
         predictive = Predictive(model=self._bnn, posterior_samples={'w': samples})
         self._predictions = predictive(rng_key_predict, X=X_test, Y=None)  # ['Y'][..., 0]
+
+
+class SWAGExperiment(Experiment):
+    def __init__(self, bnn: BayesianNeuralNetwork, data: Data, trained_map_experiment: AutoDeltaVIExperiment,
+                 learning_rate: float = 0.05, max_iter: int = 5_000, freq: int = 100, num_samples: int = 2_000):
+        super().__init__(bnn, data)
+        self._map_experiment = trained_map_experiment
+        if learning_rate > 0:
+            learning_rate = -learning_rate
+        self.learning_rate = learning_rate
+        self.max_iter = max_iter
+        self.freq = freq
+        self.num_samples = num_samples
+        # Initialise state
+        self._posterior: Optional[dist.Distribution] = None
+
+    def train(self, rng_key_train: random.PRNGKey, eps: float = 1e-30):
+        swag_optim = optax.chain(optax.clip_by_global_norm(10.0),
+                                 optax.scale(self.learning_rate),
+                                 optax_swag.swag_diag(freq=self.freq))
+        svi = SVI(self._bnn, self._map_experiment._guide, swag_optim, TraceMeanField_ELBO())
+        assert hasattr(self._map_experiment, "_params"), "MAP experiment is not trained"
+        swag_run_results = svi.run(
+            rng_key_train, num_steps=self.max_iter, stable_update=True, init_params=self._map_experiment._params,
+            X=self._data.train[0], Y=self._data.train[1])
+        swag_state = swag_run_results.state.optim_state[1][1][-1]
+        swag_loc = swag_state.mean['w_auto_loc']
+        swag_scale = jnp.sqrt(jnp.clip(swag_state.params2['w_auto_loc'] - jnp.square(swag_loc), a_min=eps))
+        self._posterior = dist.Normal(swag_loc, swag_scale).to_event(1)
+
+    def make_predictions(self, rng_key_predict: random.PRNGKey):
+        assert self._posterior is not None
+        X_test, _ = self._data.test
+        rng_key_sample_w, rng_key_sample_Y = random.split(rng_key_predict)
+        posterior_samples = {'w': self._posterior.sample(rng_key_sample_w, sample_shape=(self.num_samples,))}
+        predictive = Predictive(model=self._bnn, posterior_samples=posterior_samples)
+        self._predictions = predictive(rng_key_sample_Y, X=X_test, Y=None)
 
 
 class SequentialExperiment(SequentialExperimentBlock):
