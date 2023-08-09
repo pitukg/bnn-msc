@@ -552,9 +552,11 @@ class AutoDiagonalLaplaceExperiment(BasicVIExperiment):
 
 class SWAGExperiment(Experiment):
     def __init__(self, bnn: BayesianNeuralNetwork, data: Data, trained_map_experiment: AutoDeltaVIExperiment,
-                 learning_rate: float = 0.05, max_iter: int = 5_000, freq: int = 100, num_samples: int = 2_000):
+                 rank: int = 1, learning_rate: float = 0.05, max_iter: int = 5_000, freq: int = 100,
+                 num_samples: int = 2_000):
         super().__init__(bnn, data)
         self._map_experiment = trained_map_experiment
+        self.rank = rank  # if rank == 1 we use diagonal approximation
         if learning_rate > 0:
             learning_rate = -learning_rate
         self.learning_rate = learning_rate
@@ -565,10 +567,11 @@ class SWAGExperiment(Experiment):
         self._posterior: Optional[dist.Distribution] = None
 
     def train(self, rng_key_train: random.PRNGKey, eps: float = 1e-30):
+        swag_transform = optax_swag.swag_diag(self.freq) if self.rank < 2 else optax_swag.swag(self.freq, self.rank)
         swag_optim = optax.chain(optax.clip_by_global_norm(10.0),
                                  optax.scale(self.learning_rate),
-                                 optax_swag.swag_diag(freq=self.freq))
-        svi = SVI(self._bnn, self._map_experiment._guide, swag_optim, TraceMeanField_ELBO())
+                                 swag_transform)
+        svi = SVI(self._bnn, self._map_experiment._guide, swag_optim, Trace_ELBO())
         assert hasattr(self._map_experiment, "_params"), "MAP experiment is not trained"
         swag_run_results = svi.run(
             rng_key_train, num_steps=self.max_iter, stable_update=True, init_params=self._map_experiment._params,
@@ -576,7 +579,13 @@ class SWAGExperiment(Experiment):
         swag_state = swag_run_results.state.optim_state[1][1][-1]
         swag_loc = swag_state.mean['w_auto_loc']
         swag_scale = jnp.sqrt(jnp.clip(swag_state.params2['w_auto_loc'] - jnp.square(swag_loc), a_min=eps))
-        self._posterior = dist.Normal(swag_loc, swag_scale).to_event(1)
+        if self.rank < 2:
+            # Diagonal SWAG
+            self._posterior = dist.Normal(swag_loc, swag_scale).to_event(1)
+        else:
+            swag_cov_diag = jnp.square(swag_scale) / 2.
+            swag_cov_factor = swag_state.dparams['w_auto_loc'].T / jnp.sqrt(2 * (self.rank - 1))
+            self._posterior = dist.LowRankMultivariateNormal(swag_loc, swag_cov_factor, swag_cov_diag)
 
     def make_predictions(self, rng_key_predict: random.PRNGKey):
         assert self._posterior is not None
