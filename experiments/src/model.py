@@ -45,7 +45,7 @@ class BNNRegressor(BayesianNeuralNetwork):
         super().__init__(beta)
         self._nonlin = nonlin
         # map scales into R+ using softplus ie log(1+exp(.))
-        self._scale_nonlin = lambda xs: jax.nn.softplus(xs) + 1e-1  # Add eps so lik doesn't vanish
+        self._scale_nonlin = lambda xs: jax.nn.softplus(xs) + 1e-2  # Add eps so lik doesn't vanish
         self.D_X = D_X
         self.D_Y = D_Y
         self.D_H = D_H
@@ -58,7 +58,8 @@ class BNNRegressor(BayesianNeuralNetwork):
             assert self.D_Y == 2
         elif obs_model == "inv_gamma":
             self.OBS_MODEL = "inv_gamma"
-            self._prior_prec_obs = dist.Gamma(3.0, 1.0)
+            # self._prior_prec_obs = dist.Gamma(3.0, 1.0)
+            self._prior_prec_obs = dist.Gamma(1.0, 0.025)
         elif obs_model == "classification":
             self.OBS_MODEL = "classification"
         elif isinstance(obs_model, float):
@@ -129,9 +130,10 @@ class BNNRegressor(BayesianNeuralNetwork):
         assert prior_type == "xavier"
         idx = jnp.arange(self.get_weight_dim())
         for depth, width in enumerate([self.D_X] + self.D_H):
-            res[self._wi_from_flat(idx, depth)] /= float(width)
+            # Divide variance by dimension of current hidden state -> divide scale by sqrt
+            res[self._wi_from_flat(idx, depth)] /= np.sqrt(width)
             if self._biases:
-                res[self._wi_from_flat(idx, depth, bias=True)] /= float(width)
+                res[self._wi_from_flat(idx, depth, bias=True)] /= np.sqrt(width)
         return res
 
     # noinspection PyPep8Naming

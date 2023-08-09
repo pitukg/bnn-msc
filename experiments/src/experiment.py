@@ -33,8 +33,9 @@ import tqdm
 from jax import lax, vmap
 from numpyro import handlers
 from numpyro.distributions import constraints
-from numpyro.infer import autoguide, MCMC, NUTS, Predictive, SVI, TraceMeanField_ELBO
+from numpyro.infer import autoguide, MCMC, NUTS, Predictive, SVI, TraceMeanField_ELBO, Trace_ELBO
 from numpyro.infer.svi import SVIState
+from numpyro.util import not_jax_tracer
 
 from .data import Data, DataSlice
 from .model import BayesianNeuralNetwork
@@ -103,9 +104,10 @@ class SequentialExperimentBlock(Experiment):
 
 
 class BasicHMCExperiment(Experiment):
-    def __init__(self, bnn: BayesianNeuralNetwork, data: Data, num_samples: int = 2_000,
-                 num_warmup: int = 1_000, num_chains: int = 1, group_by_chain: bool = False):
+    def __init__(self, bnn: BayesianNeuralNetwork, data: Data, init_params: Optional[dict] = None,
+                 num_samples: int = 2_000, num_warmup: int = 1_000, num_chains: int = 1, group_by_chain: bool = False):
         super().__init__(bnn, data)
+        self._init_params = init_params
         self._num_samples = num_samples
         self._num_warmup = num_warmup
         self._num_chains = num_chains
@@ -133,7 +135,7 @@ class BasicHMCExperiment(Experiment):
             self._mcmc.progress_bar = progress_bar
             if self._mcmc.post_warmup_state is not None:
                 rng_key_train = self._mcmc.post_warmup_state.rng_key
-        self._mcmc.run(rng_key_train, X, Y)
+        self._mcmc.run(rng_key_train, init_params=self._init_params, X=X, Y=Y)
         if progress_bar:
             # mcmc.print_summary()
             print("\nMCMC elapsed time:", time.time() - start)
@@ -147,8 +149,9 @@ class BasicHMCExperiment(Experiment):
         assert self._samples is not None
         X_test, _ = self._data.test
         if not self._group_by_chain:
-            self._predictions = Predictive(self._bnn, self._samples, return_sites=['Y_mean', 'Y_std', 'Y_p', 'Y'])(
-                rng_key_predict, X=X_test, Y=None)  # ['Y'][..., 0]
+            self._predictions = Predictive(
+                self._bnn, self._samples, return_sites=['Y_mean', 'Y_scale', 'Y_p', 'Y', 'sigma_obs'])(
+                    rng_key_predict, X=X_test, Y=None)  # ['Y'][..., 0]
         else:
             def pred(rng_key, samples):
                 return Predictive(self._bnn, samples)(rng_key, X=X_test, Y=None)
@@ -264,15 +267,17 @@ class BasicVIExperiment(SequentialExperimentBlock):
 
         init_eval_loss = eval_loss.loss(
             rng_key_init_loss, self._svi.get_params(self._saved_svi_state), self._bnn, self._guide, X=X, Y=Y)
-        print("Initial eval loss: {:.4f} (lik: {:.4f}, kl: {:.4f})".format(
-            init_eval_loss["loss"], init_eval_loss["elbo_lik"], init_eval_loss["elbo_kl"]))
+        traced = not not_jax_tracer(init_eval_loss["loss"])
+        if not traced:
+            print("Initial eval loss: {:.4f} (lik: {:.4f}, kl: {:.4f})".format(
+                init_eval_loss["loss"], init_eval_loss["elbo_lik"], init_eval_loss["elbo_kl"]))
 
         batch = max(num_iter // 50, 1)
-        with tqdm.trange(1, num_iter // batch + 1) as t:
+        with tqdm.trange(1, num_iter // batch + 1, disable=traced) as t:
             for i in t:
                 self._saved_svi_state, batch_losses = lax.scan(body_fn, self._saved_svi_state, None, length=batch)
                 self._losses = jnp.concatenate((self._losses, batch_losses))
-                valid_losses = [x for x in batch_losses if x == x]
+                valid_losses = [x for x in batch_losses if traced or x == x]
                 num_valid = len(valid_losses)
                 if num_valid == 0:
                     avg_loss = float("nan")
@@ -287,14 +292,16 @@ class BasicVIExperiment(SequentialExperimentBlock):
                     jnp.array([[eval_loss_res["loss"], eval_loss_res["elbo_lik"], eval_loss_res["elbo_kl"]]]),
                     axis=0
                 )
-                t.set_postfix_str(
-                    "init loss: {:.4f}, avg. train loss / eval. loss [{}-{}]: {:.4f} / {:.4f}".format(
-                        self._losses[0], (i - 1) * batch, i * batch, avg_loss, eval_loss_res["loss"]
-                    ),
-                    refresh=False,
-                )
+                if not traced:
+                    t.set_postfix_str(
+                        "init loss: {:.4f}, avg. train loss / eval. loss [{}-{}]: {:.4f} / {:.4f}".format(
+                            self._losses[0], (i - 1) * batch, i * batch, avg_loss, eval_loss_res["loss"]
+                        ),
+                        refresh=False,
+                    )
         self._params = self._svi.get_params(self._saved_svi_state)
-        print("\nSVI elapsed time:", time.time() - start)
+        if not traced:
+            print("\nSVI elapsed time:", time.time() - start)
 
     def make_predictions(self, rng_key_predict: random.PRNGKey):
         assert self._params is not None and self._guide is not None
@@ -375,8 +382,33 @@ class AutoMeanFieldNormalVIExperiment(BasicVIExperiment):
 
 
 class AutoDeltaVIExperiment(BasicVIExperiment):
+    def __init__(self, bnn: BayesianNeuralNetwork, data: Data, max_iter: int = 150_000,
+                 lr_schedule: optax.Schedule = optax.constant_schedule(-0.001)):
+        # Things are deterministic -> single sample enough
+        super().__init__(bnn, data, num_samples=1, max_iter=max_iter, lr_schedule=lr_schedule,
+                         num_particles=1, num_eval_particles=1)
+
     def _get_guide(self) -> Callable:
-        return autoguide.AutoDelta(self._bnn, init_loc_fn=init_loc_fn)
+        bnn_weight_dim = self._bnn.get_weight_dim()
+        _, prec_obs_prior = self._bnn.prior
+
+        def guide(X, Y=None):
+            w_loc = numpyro.param("w_loc", lambda rng_key: dist.Normal(scale=0.25).sample(rng_key, (bnn_weight_dim,)))
+            with handlers.scale(scale=self._bnn.BETA):
+                numpyro.sample("w", dist.Delta(w_loc).to_event(1))
+            if prec_obs_prior is not None:
+                # See comment above for initialising prec_obs to its point mass as it is masked!
+                # Taking the prior mean returns the delta mass location in the Delta case
+                prec_obs_loc = numpyro.param("prec_obs_loc", prec_obs_prior.mean, constraint=constraints.positive)
+                prec_obs_dist = dist.Delta(prec_obs_loc)
+                if isinstance(prec_obs_prior, dist.MaskedDistribution):
+                    # Treat prec_obs as constant here, decouple from parameter completely,
+                    # otherwise it would give MAP on uniform improper prior
+                    del prec_obs_dist  # Lose dependence on "prec_obs_loc" numpyro.param
+                    prec_obs_dist = dist.Delta(prec_obs_prior.mean)
+                numpyro.sample("prec_obs", prec_obs_dist)
+        return guide
+        # return autoguide.AutoDelta(self._bnn, init_loc_fn=init_loc_fn)
 
     @property
     def posterior(self) -> tuple[dist.Distribution, dist.Distribution]:
