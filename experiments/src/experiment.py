@@ -10,9 +10,9 @@ __all__ = [
     "SequentialExperiment",
     "ExperimentWithLastBlockReplaced",
     "init_loc_fn",
+    "plot_prior_samples",
 ]
 
-import functools
 import os
 import time
 import warnings
@@ -31,9 +31,10 @@ import optax
 import optax_swag
 import tqdm
 from jax import lax, vmap
+from jax.scipy.special import logsumexp
 from numpyro import handlers
 from numpyro.distributions import constraints
-from numpyro.infer import autoguide, MCMC, NUTS, Predictive, SVI, TraceMeanField_ELBO, Trace_ELBO
+from numpyro.infer import autoguide, log_likelihood, MCMC, NUTS, Predictive, SVI, TraceMeanField_ELBO, Trace_ELBO
 from numpyro.infer.svi import SVIState
 from numpyro.util import not_jax_tracer
 
@@ -94,6 +95,14 @@ class Experiment(ABC):
         fig = self.make_plots()
         return fig
 
+    # @abstractmethod
+    # def test_loglik(self) -> float:
+    #     """ Calculate loglikelihood of test observations, based on the trained experiment's posterior.
+    #         This is a common metric for assessing generalisation and comparing performance of Bayesian models.
+    #     :return: posterior log-likelihood of observations in test
+    #     """
+    #     raise NotImplementedError()
+
 
 class SequentialExperimentBlock(Experiment):
     @property
@@ -101,6 +110,12 @@ class SequentialExperimentBlock(Experiment):
     def posterior(self) -> tuple[dist.Distribution, dist.Distribution]:
         """ Returns distribution on w and prec_obs """
         raise NotImplementedError()
+
+    # TODO: in general we can't compute this integral yeah? but eg constant prec normal obs & normal w-post. we can
+    # TODO: o/w we resort to sampling posterior and logexpsum approx?
+    # def test_loglik(self) -> float:
+    #     # !!Note this ignores posterior on prec_obs altogether
+    #     w_posterior = self.posterior[0]
 
 
 class BasicHMCExperiment(Experiment):
@@ -151,12 +166,23 @@ class BasicHMCExperiment(Experiment):
         if not self._group_by_chain:
             self._predictions = Predictive(
                 self._bnn, self._samples, return_sites=['Y_mean', 'Y_scale', 'Y_p', 'Y', 'sigma_obs'])(
-                    rng_key_predict, X=X_test, Y=None)  # ['Y'][..., 0]
+                rng_key_predict, X=X_test, Y=None)  # ['Y'][..., 0]
         else:
             def pred(rng_key, samples):
                 return Predictive(self._bnn, samples)(rng_key, X=X_test, Y=None)
 
             self._predictions = vmap(pred)(random.split(rng_key_predict, self._num_chains), self._samples)
+
+    def test_loglik(self) -> float:
+        assert np.prod(jnp.shape(self._samples['w'])) > 0, "HMC not trained"
+        assert self._data.test[1] is not None, "Data does not contain test Y values"
+        batch_ndims = 1 if not self._group_by_chain else 2
+        logliks = log_likelihood(self._bnn, self._samples, batch_ndims=batch_ndims,
+                                 X=self._data.test[0], Y=self._data.test[1])
+        assert jnp.shape(logliks['Y'])[1] == jnp.shape(self._data.test[0])[0]
+        num_samples = jnp.shape(logliks['Y'])[0]
+        logliks = logliks['Y'].sum(axis=1)
+        return logsumexp(logliks) - jnp.log(num_samples)
 
 
 class EvalLoss:
@@ -383,9 +409,9 @@ class AutoMeanFieldNormalVIExperiment(BasicVIExperiment):
 
 class AutoDeltaVIExperiment(BasicVIExperiment):
     def __init__(self, bnn: BayesianNeuralNetwork, data: Data, max_iter: int = 150_000,
-                 lr_schedule: optax.Schedule = optax.constant_schedule(-0.001)):
-        # Things are deterministic -> single sample enough
-        super().__init__(bnn, data, num_samples=1, max_iter=max_iter, lr_schedule=lr_schedule,
+                 lr_schedule: optax.Schedule = optax.constant_schedule(-0.001), num_samples: int = 200):
+        # Things are deterministic -> single sample enough for loss
+        super().__init__(bnn, data, num_samples=num_samples, max_iter=max_iter, lr_schedule=lr_schedule,
                          num_particles=1, num_eval_particles=1)
 
     def _get_guide(self) -> Callable:
@@ -407,11 +433,13 @@ class AutoDeltaVIExperiment(BasicVIExperiment):
                     del prec_obs_dist  # Lose dependence on "prec_obs_loc" numpyro.param
                     prec_obs_dist = dist.Delta(prec_obs_prior.mean)
                 numpyro.sample("prec_obs", prec_obs_dist)
+
         return guide
         # return autoguide.AutoDelta(self._bnn, init_loc_fn=init_loc_fn)
 
     @property
     def posterior(self) -> tuple[dist.Distribution, dist.Distribution]:
+        # TODO: return dist.Delta
         raise NotImplementedError()
 
 
@@ -528,37 +556,24 @@ class AutoDiagonalLaplaceApproximation(autoguide.AutoLaplaceApproximation):
 init_loc_fn = numpyro.infer.init_to_sample
 
 
-class AutoDiagonalLaplaceExperiment(BasicVIExperiment):
-    def __init__(self, bnn: BayesianNeuralNetwork, data: Data, shrink: float = 25.0, num_samples: int = 2_000,
-                 max_iter: int = 150_000, lr_schedule: optax.Schedule = optax.constant_schedule(-0.001),
-                 num_particles: int = 16, num_eval_particles: int = 128):
-        super().__init__(bnn, data, num_samples, max_iter, lr_schedule, num_particles, num_eval_particles)
+class AutoDiagonalLaplaceExperiment(SequentialExperimentBlock):
+    def __init__(self, bnn: BayesianNeuralNetwork, data: Data, trained_map_experiment: AutoDeltaVIExperiment,
+                 shrink: float = 25.0, num_samples: int = 400):
+        super().__init__(bnn, data)
+        self._map_experiment = trained_map_experiment
         self._shrink = shrink
+        self._num_samples = num_samples
         self._posterior = None
 
-    def _get_guide(self) -> Callable:
-        # self._guide = AutoDiagonalLaplaceApproximation(
-        #     self._bnn, init_loc_fn=functools.partial(numpyro.infer.init_to_uniform, radius=1.2),
-        #     hessian_diag_fn=lambda f, x: jnp.diag(jax.hessian(f)(x)) + jnp.full((x.shape[-1],), self._shrink),
-        #     # hessian_diag_fn=lambda f, x: optax.fisher_diag(lambda params, _, __: f(params), x, None, None) +
-        #     #                              jnp.full((x.shape[-1],), self._shrink),
-        # )
-        self._guide = autoguide.AutoDelta(self._bnn, init_loc_fn=init_loc_fn)
-        return self._guide
-
-    @property
-    def posterior(self) -> tuple[dist.Distribution, Optional[dist.Distribution]]:
-        return self._posterior, None
-
-    def _calculate_curvature(self):
+    def train(self, rng_key_train: random.PRNGKey):
         loss = TraceMeanField_ELBO(num_particles=1)
         rng_key = random.PRNGKey(0)
 
         def negative_loglik(params, inputs, targets):
-            return loss.loss(rng_key, params, self._bnn, self._guide, X=inputs, Y=targets)
+            return loss.loss(rng_key, params, self._bnn, self._map_experiment._guide, X=inputs, Y=targets)
 
         X, Y = self._data.train
-        precision = optax.fisher_diag(negative_loglik, self._params, X, Y)
+        precision = optax.fisher_diag(negative_loglik, self._map_experiment._params, X, Y)
         precision += self._shrink
         scale = 1. / jnp.sqrt(precision)
         if numpyro.util.not_jax_tracer(scale):
@@ -570,12 +585,16 @@ class AutoDiagonalLaplaceExperiment(BasicVIExperiment):
                     stacklevel=numpyro.util.find_stack_level(),
                 )
         scale = jnp.where(jnp.isnan(scale), 0.0, scale)
-        loc = self._params["w_auto_loc"]
-        self._posterior = dist.Normal(loc, scale)
+        loc = self._map_experiment._params["w_loc"]
+        self._posterior = dist.Normal(loc, scale).to_event(1)
+
+    @property
+    def posterior(self) -> tuple[dist.Distribution, Optional[dist.Distribution]]:
+        return self._posterior, None
 
     def make_predictions(self, rng_key_predict: random.PRNGKey):
-        assert self._params is not None and self._guide is not None
-        self._calculate_curvature()
+        assert self._map_experiment._params is not None and self._map_experiment._guide is not None
+        assert self._posterior is not None
         X_test, _ = self._data.test
         samples = self._posterior.sample(rng_key_predict, sample_shape=(self._num_samples,))
         predictive = Predictive(model=self._bnn, posterior_samples={'w': samples})
@@ -609,14 +628,14 @@ class SWAGExperiment(Experiment):
             rng_key_train, num_steps=self.max_iter, stable_update=True, init_params=self._map_experiment._params,
             X=self._data.train[0], Y=self._data.train[1])
         swag_state = swag_run_results.state.optim_state[1][1][-1]
-        swag_loc = swag_state.mean['w_auto_loc']
-        swag_scale = jnp.sqrt(jnp.clip(swag_state.params2['w_auto_loc'] - jnp.square(swag_loc), a_min=eps))
+        swag_loc = swag_state.mean['w_loc']
+        swag_scale = jnp.sqrt(jnp.clip(swag_state.params2['w_loc'] - jnp.square(swag_loc), a_min=eps))
         if self.rank < 2:
             # Diagonal SWAG
             self._posterior = dist.Normal(swag_loc, swag_scale).to_event(1)
         else:
             swag_cov_diag = jnp.square(swag_scale) / 2.
-            swag_cov_factor = swag_state.dparams['w_auto_loc'].T / jnp.sqrt(2 * (self.rank - 1))
+            swag_cov_factor = swag_state.dparams['w_loc'].T / jnp.sqrt(2 * (self.rank - 1))
             self._posterior = dist.LowRankMultivariateNormal(swag_loc, swag_cov_factor, swag_cov_diag)
 
     def make_predictions(self, rng_key_predict: random.PRNGKey):
@@ -626,6 +645,25 @@ class SWAGExperiment(Experiment):
         posterior_samples = {'w': self._posterior.sample(rng_key_sample_w, sample_shape=(self.num_samples,))}
         predictive = Predictive(model=self._bnn, posterior_samples=posterior_samples)
         self._predictions = predictive(rng_key_sample_Y, X=X_test, Y=None)
+
+
+def plot_prior_samples(bnn: BayesianNeuralNetwork, data: Data, ndraws=15, nsamples=400, fig=None, ax=None):
+    if fig is None or ax is None:
+        fig, ax = plt.subplots()
+    t = data.test[0][:, 1]
+
+    with handlers.seed(rng_seed=random.PRNGKey(0)):
+        # for _ in range(nsamples):
+        #     prior_fn = handlers.trace(bnn).get_trace(X=data.test[0], Y=None)
+        #     mu = prior_fn['Y_mean']['value'].squeeze()
+        for _ in range(ndraws):
+            prior_fn = handlers.trace(bnn).get_trace(X=data.test[0], Y=None)
+            mu = prior_fn['Y_mean']['value'].squeeze()
+            sigma = prior_fn['Y_scale']['value'].squeeze() if 'Y_scale' in prior_fn.keys() else \
+                prior_fn['sigma_obs']['value']
+            ax.plot(t, mu)
+            ax.fill_between(t, mu - sigma, mu + sigma, alpha=0.05)
+    return fig
 
 
 class SequentialExperiment(SequentialExperimentBlock):

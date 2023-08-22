@@ -167,11 +167,11 @@ class Sign(Data):
 
 
 class LinearData(Data):
-    def __init__(self, intercept: float, beta: float, sigma_obs=0.05, train_size=50, test_size=500):
+    def __init__(self, intercept: float, beta: float, D_X=3, sigma_obs=0.05, train_size=50, test_size=500):
         self.intercept = intercept
         self.beta = beta
+        self.D_X = D_X
         self.sigma_obs = sigma_obs
-        self.D_X = 2  # 1 + x
         D_Y = 1  # create 1d outputs
         np.random.seed(0)
         X = jnp.concatenate((jnp.linspace(-1, -0.4, train_size // 2),
@@ -186,9 +186,9 @@ class LinearData(Data):
         X_test = jnp.linspace(-3., 3., test_size)
         X_test = self._feature_expand(X_test)
 
-        self._X = X[:, 1:]  # remove intercept b/c of biases
+        self._X = X
         self._Y = Y
-        self._X_test = X_test[:, 1:]  # remove intercept b/c of biases
+        self._X_test = X_test
         self._Y_test = None
 
     def _feature_expand(self, X: jax.Array):
