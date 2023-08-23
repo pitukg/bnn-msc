@@ -2,4 +2,4 @@
 
 EXPERIMENTS_ROOT=$HOME/DataspellProjects/bnn/experiments
 
-scp $EXPERIMENTS_ROOT/src/{data,experiment,model}.py whistlingswan:teaching-home/experiments/src/
+scp $EXPERIMENTS_ROOT/src/{data,experiment,factory,model}.py whistlingswan:teaching-home/experiments/src/

@@ -1,4 +1,5 @@
 __all__ = [
+    "Experiment",
     "BasicHMCExperiment",
     "AutoDeltaVIExperiment",
     "AutoMeanFieldNormalVIExperiment",
@@ -14,6 +15,7 @@ __all__ = [
 ]
 
 import os
+import pickle
 import time
 import warnings
 from abc import ABC, abstractmethod
@@ -38,6 +40,7 @@ from numpyro.infer import autoguide, log_likelihood, MCMC, NUTS, Predictive, SVI
 from numpyro.infer.svi import SVIState
 from numpyro.util import not_jax_tracer
 from scipy import stats
+from typing_extensions import Self
 
 from .data import Data, DataSlice
 from .model import BayesianNeuralNetwork
@@ -144,6 +147,31 @@ class Experiment(ABC):
 
         else:
             raise NotImplementedError()
+
+    def __getstate__(self) -> dict:
+        return {
+            k: v
+            for k, v in self.__dict__.items()
+            if k not in ("_bnn", "_data", "_predictions", "_mcmc", "_svi", "_saved_svi_state", "_guide", "_lr_schedule")
+        }
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._bnn = None
+        self._data = None
+        self._predictions = None
+
+    def to_pickle(self, filename: str):
+        with open(filename, "wb") as f:
+            pickle.dump(self, f)
+
+    @staticmethod
+    def from_pickle(bnn: BayesianNeuralNetwork, data: Data, filename: str):
+        with open(filename, "rb") as f:
+            experiment = pickle.load(f)
+        experiment._bnn = bnn
+        experiment._data = data
+        return experiment
 
 
 class SequentialExperimentBlock(Experiment):
@@ -337,7 +365,9 @@ class BasicVIExperiment(SequentialExperimentBlock):
         rng_key_train, rng_key_eval, rng_key_init_loss = random.split(rng_key_train, 3)
 
         if self._saved_svi_state is None:
-            self._saved_svi_state = self._svi.init(rng_key_train, X=X, Y=Y)
+            # If restoring from pickle _params will be set, so we initialize from there
+            # otherwise _params will be None and this will have no effect
+            self._saved_svi_state = self._svi.init(rng_key_train, init_params=self._params, X=X, Y=Y)
 
         def body_fn(svi_state, _):
             svi_state, loss = self._svi.stable_update(svi_state, X=X, Y=Y)
@@ -382,7 +412,7 @@ class BasicVIExperiment(SequentialExperimentBlock):
             print("\nSVI elapsed time:", time.time() - start)
 
     def make_predictions(self, rng_key_predict: random.PRNGKey):
-        assert self._params is not None and self._guide is not None
+        assert self._params is not None
         X_test, _ = self._data.test
         predictive = Predictive(model=self._bnn, guide=self._guide,
                                 params=self._params, num_samples=self._num_samples)
@@ -415,13 +445,25 @@ class BasicVIExperiment(SequentialExperimentBlock):
     def get_posterior_samples(self, rng_key=random.PRNGKey(0), **kwargs) -> dict:
         return super().get_posterior_samples(rng_key, self._num_samples)
 
+    @staticmethod
+    def from_pickle(bnn: BayesianNeuralNetwork, data: Data, filename: str):
+        experiment = Experiment.from_pickle(bnn, data, filename)
+        experiment._svi = None
+        experiment._saved_svi_state = None
+        experiment._guide = None
+        experiment._lr_schedule = optax.constant_schedule(-0.005)  # Can't be pickled
+        # Make sure state is initialised
+        experiment.train(random.PRNGKey(0), num_iter=0)
+        return experiment
+
 
 class BasicMeanFieldGaussianVIExperiment(BasicVIExperiment):
     def _get_guide(self) -> Callable[[jnp.ndarray, Optional[jnp.ndarray]], Any]:
         bnn_weight_dim = self._bnn.get_weight_dim()
+        bnn_weight_prior = self._bnn.prior[0]
 
         def guide(X, Y=None):
-            w_loc = numpyro.param("w_loc", lambda rng_key: dist.Normal(scale=0.25).sample(rng_key, (bnn_weight_dim,)))
+            w_loc = numpyro.param("w_loc", lambda rng_key: bnn_weight_prior.sample(rng_key))
             w_scale = numpyro.param("w_scale", jnp.full((bnn_weight_dim,), 1e-5),
                                     constraint=constraints.softplus_positive)
             with handlers.scale(scale=self._bnn.BETA):
@@ -471,10 +513,11 @@ class AutoDeltaVIExperiment(BasicVIExperiment):
 
     def _get_guide(self) -> Callable:
         bnn_weight_dim = self._bnn.get_weight_dim()
+        bnn_weight_prior = self._bnn.prior[0]
         _, prec_obs_prior = self._bnn.prior
 
         def guide(X, Y=None):
-            w_loc = numpyro.param("w_loc", lambda rng_key: dist.Normal(scale=0.25).sample(rng_key, (bnn_weight_dim,)))
+            w_loc = numpyro.param("w_loc", lambda rng_key: bnn_weight_prior.sample(rng_key) * 1.4)
             with handlers.scale(scale=self._bnn.BETA):
                 numpyro.sample("w", dist.Delta(w_loc).to_event(1))
             if prec_obs_prior is not None:
@@ -500,9 +543,10 @@ class AutoDeltaVIExperiment(BasicVIExperiment):
 class BasicFullRankGaussianVIExperiment(BasicVIExperiment):
     def _get_guide(self) -> Callable[[jnp.ndarray, Optional[jnp.ndarray]], Any]:
         bnn_weight_dim = self._bnn.get_weight_dim()
+        bnn_weight_prior = self._bnn.prior[0]
 
         def guide(X, Y=None):
-            w_loc = numpyro.param("w_loc", lambda rng_key: dist.Normal().sample(rng_key, (bnn_weight_dim,)))
+            w_loc = numpyro.param("w_loc", lambda rng_key: bnn_weight_prior.sample(rng_key))
             w_cov = numpyro.param("w_cov", 0.1 * jnp.eye(bnn_weight_dim), constraint=constraints.positive_definite)
             with handlers.scale(scale=self._bnn.BETA):
                 numpyro.sample("w", dist.MultivariateNormal(w_loc, w_cov))
@@ -654,6 +698,19 @@ class AutoDiagonalLaplaceExperiment(SequentialExperimentBlock):
         predictive = Predictive(model=self._bnn, posterior_samples={'w': samples})
         self._predictions = predictive(rng_key_predict, X=X_test, Y=None)  # ['Y'][..., 0]
 
+    @staticmethod
+    def from_pickle(bnn: BayesianNeuralNetwork, data: Data, filename: str):
+        experiment = Experiment.from_pickle(bnn, data, filename)
+        experiment._map_experiment._bnn = bnn
+        experiment._map_experiment._data = data
+        experiment._map_experiment._svi = None
+        experiment._map_experiment._saved_svi_state = None
+        experiment._map_experiment._guide = None
+        experiment._map_experiment._lr_schedule = optax.constant_schedule(-0.005)  # Can't be pickled
+        # Make sure state is initialised
+        experiment._map_experiment.train(random.PRNGKey(0), num_iter=0)
+        return experiment
+
 
 class SWAGExperiment(SequentialExperimentBlock):
     def __init__(self, bnn: BayesianNeuralNetwork, data: Data, trained_map_experiment: AutoDeltaVIExperiment,
@@ -703,6 +760,19 @@ class SWAGExperiment(SequentialExperimentBlock):
     @property
     def posterior(self) -> tuple[dist.Distribution, Optional[dist.Distribution]]:
         return self._posterior, None
+
+    @staticmethod
+    def from_pickle(bnn: BayesianNeuralNetwork, data: Data, filename: str):
+        experiment = Experiment.from_pickle(bnn, data, filename)
+        experiment._map_experiment._bnn = bnn
+        experiment._map_experiment._data = data
+        experiment._map_experiment._svi = None
+        experiment._map_experiment._saved_svi_state = None
+        experiment._map_experiment._guide = None
+        experiment._map_experiment._lr_schedule = optax.constant_schedule(-0.005)  # Can't be pickled
+        # Make sure state is initialised
+        experiment._map_experiment.train(random.PRNGKey(0), num_iter=0)
+        return experiment
 
 
 def plot_prior_samples(bnn: BayesianNeuralNetwork, data: Data, ndraws=15, nsamples=400, fig=None, ax=None):
