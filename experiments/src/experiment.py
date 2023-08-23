@@ -37,6 +37,7 @@ from numpyro.distributions import constraints
 from numpyro.infer import autoguide, log_likelihood, MCMC, NUTS, Predictive, SVI, TraceMeanField_ELBO, Trace_ELBO
 from numpyro.infer.svi import SVIState
 from numpyro.util import not_jax_tracer
+from scipy import stats
 
 from .data import Data, DataSlice
 from .model import BayesianNeuralNetwork
@@ -58,7 +59,7 @@ class Experiment(ABC):
     def make_predictions(self, rng_key_predict: random.PRNGKey):
         pass
 
-    def make_plots(self, fig=None, ax=None, **kwargs) -> plt.Figure:
+    def make_plots(self, fig=None, ax=None, plot_bald=False, legend=False, **kwargs) -> plt.Figure:
         assert self._predictions is not None
         X, Y = self._data.train
         X_test, _ = self._data.test
@@ -75,9 +76,14 @@ class Experiment(ABC):
             # plot training data
             ax.plot(X[:, 1], Y[:, 0], "kx")
             # plot predictions & quantiles
-            ax.plot(X_test[:, 1], mean_means, color="blue")
+            ax.plot(X_test[:, 1], mean_means, color="blue", label="Posterior mean")
             ax.fill_between(X_test[:, 1], *mean_percentiles, color="orange", alpha=0.5, label="90% CI on mean")
             ax.fill_between(X_test[:, 1], *Y_percentiles, color="lightgreen", alpha=0.5, label="90% prediction")
+            if plot_bald:
+                bald_scores = self.compute_test_bald_scores()
+                ax.plot(X_test[:, 1], bald_scores, color="black", alpha=0.6, label="BALD score")
+            if legend:
+                ax.legend()
         else:
             percentiles90 = jnp.percentile(self._predictions['Y_p'][:, :, 0, 1], q=jnp.array([5.0, 95.0]), axis=0)
             percentiles50 = jnp.percentile(self._predictions['Y_p'][:, :, 0, 1], q=jnp.array([25.0, 75.0]), axis=0)
@@ -95,27 +101,68 @@ class Experiment(ABC):
         fig = self.make_plots()
         return fig
 
-    # @abstractmethod
-    # def test_loglik(self) -> float:
-    #     """ Calculate loglikelihood of test observations, based on the trained experiment's posterior.
-    #         This is a common metric for assessing generalisation and comparing performance of Bayesian models.
-    #     :return: posterior log-likelihood of observations in test
-    #     """
-    #     raise NotImplementedError()
+    @abstractmethod
+    def get_posterior_samples(self, **kwargs) -> dict:
+        # Should be keyed by w and have dimensions (num_samples, p)
+        raise NotImplementedError()
+
+    def test_loglik(self) -> float:
+        """ Calculate loglikelihood of test observations, based on the trained experiment's posterior.
+            This is a common metric for assessing generalisation and comparing performance of Bayesian models.
+        :return: posterior log-likelihood of observations in test
+        """
+        samples = self.get_posterior_samples()
+        assert np.prod(jnp.shape(samples['w'])) > 0, "Experiment not trained"
+        assert self._data.test[1] is not None, "Data does not contain test Y values"
+        logliks = log_likelihood(self._bnn, samples, X=self._data.test[0], Y=self._data.test[1])
+        assert jnp.shape(logliks['Y'])[1] == jnp.shape(self._data.test[0])[0]
+        num_samples = jnp.shape(logliks['Y'])[0]
+        logliks = logliks['Y'].sum(axis=1)
+        return logsumexp(logliks) - jnp.log(num_samples)
+
+    def compute_test_bald_scores(self, rng_key=random.PRNGKey(0)):
+        assert self._predictions is not None, "Experiment not trained"
+        if self._bnn.OBS_MODEL != "classification":
+            # H[ y | x_test, D ]
+            Y_pred = self._predictions["Y"][..., 0]
+            posterior_Y_entropy = stats.differential_entropy(Y_pred, axis=0)
+            # E_{w ~ p(.|D)} H[ y | x_test, w ]
+            samples = self.get_posterior_samples()
+            num_samples = jnp.shape(samples["w"])[0]
+
+            def gaussian_entropy(locs, scales):
+                return jnp.log(scales) + 0.5 * (jnp.log(2. * jnp.pi) + 1.)
+
+            def cond_entropy(sample, rng_key):
+                conditioned_model = handlers.condition(handlers.seed(self._bnn, rng_key), sample)
+                trace = handlers.trace(conditioned_model).get_trace(X=self._data.test[0], Y=None)
+                conditional_distribution = trace["Y"]["fn"].base_dist
+                return gaussian_entropy(conditional_distribution.loc, conditional_distribution.scale)
+
+            Y_cond_entropies = vmap(cond_entropy)(samples, random.split(rng_key, num_samples))[..., 0]
+            return posterior_Y_entropy - jnp.mean(Y_cond_entropies, axis=0)
+
+        else:
+            raise NotImplementedError()
 
 
 class SequentialExperimentBlock(Experiment):
     @property
     @abstractmethod
-    def posterior(self) -> tuple[dist.Distribution, dist.Distribution]:
+    def posterior(self) -> tuple[dist.Distribution, Optional[dist.Distribution]]:
         """ Returns distribution on w and prec_obs """
         raise NotImplementedError()
+
+    def get_posterior_samples(self, rng_key=random.PRNGKey(0), num_samples=400, **kwargs) -> dict:
+        w_posterior = self.posterior[0]
+        samples = w_posterior.sample(rng_key, (num_samples,))
+        assert jnp.shape(samples) == (num_samples, self._bnn.get_weight_dim())
+        return {'w': samples}
 
     # TODO: in general we can't compute this integral yeah? but eg constant prec normal obs & normal w-post. we can
     # TODO: o/w we resort to sampling posterior and logexpsum approx?
     # def test_loglik(self) -> float:
-    #     # !!Note this ignores posterior on prec_obs altogether
-    #     w_posterior = self.posterior[0]
+    #     raise NotImplementedError()
 
 
 class BasicHMCExperiment(Experiment):
@@ -183,6 +230,11 @@ class BasicHMCExperiment(Experiment):
         num_samples = jnp.shape(logliks['Y'])[0]
         logliks = logliks['Y'].sum(axis=1)
         return logsumexp(logliks) - jnp.log(num_samples)
+
+    def get_posterior_samples(self) -> dict:
+        if self._group_by_chain:
+            raise NotImplementedError()
+        return self._samples
 
 
 class EvalLoss:
@@ -346,7 +398,7 @@ class BasicVIExperiment(SequentialExperimentBlock):
 
     @property
     @abstractmethod
-    def posterior(self) -> tuple[dist.Distribution, dist.Distribution]:
+    def posterior(self) -> tuple[dist.Distribution, Optional[dist.Distribution]]:
         """ :returns distribution of w and (prec_obs if in the model)
             Note if prec_obs has a Delta distribution, it should be marked as masked so that
             hack with keeping it constant under another Delta approximation doesn't blow up loss
@@ -359,6 +411,9 @@ class BasicVIExperiment(SequentialExperimentBlock):
         # in the guide, prec_obs is treated as a constant and not as a numpy.param + Delta
         # so that gradients exist and loss is not inf
         raise NotImplementedError()
+
+    def get_posterior_samples(self, rng_key=random.PRNGKey(0), **kwargs) -> dict:
+        return super().get_posterior_samples(rng_key, self._num_samples)
 
 
 class BasicMeanFieldGaussianVIExperiment(BasicVIExperiment):
@@ -438,9 +493,8 @@ class AutoDeltaVIExperiment(BasicVIExperiment):
         # return autoguide.AutoDelta(self._bnn, init_loc_fn=init_loc_fn)
 
     @property
-    def posterior(self) -> tuple[dist.Distribution, dist.Distribution]:
-        # TODO: return dist.Delta
-        raise NotImplementedError()
+    def posterior(self) -> tuple[dist.Distribution, Optional[dist.Distribution]]:
+        return dist.Delta(self._params['w_loc']), None
 
 
 class BasicFullRankGaussianVIExperiment(BasicVIExperiment):
@@ -601,7 +655,7 @@ class AutoDiagonalLaplaceExperiment(SequentialExperimentBlock):
         self._predictions = predictive(rng_key_predict, X=X_test, Y=None)  # ['Y'][..., 0]
 
 
-class SWAGExperiment(Experiment):
+class SWAGExperiment(SequentialExperimentBlock):
     def __init__(self, bnn: BayesianNeuralNetwork, data: Data, trained_map_experiment: AutoDeltaVIExperiment,
                  rank: int = 1, learning_rate: float = 0.05, max_iter: int = 5_000, freq: int = 100,
                  num_samples: int = 2_000):
@@ -645,6 +699,10 @@ class SWAGExperiment(Experiment):
         posterior_samples = {'w': self._posterior.sample(rng_key_sample_w, sample_shape=(self.num_samples,))}
         predictive = Predictive(model=self._bnn, posterior_samples=posterior_samples)
         self._predictions = predictive(rng_key_sample_Y, X=X_test, Y=None)
+
+    @property
+    def posterior(self) -> tuple[dist.Distribution, Optional[dist.Distribution]]:
+        return self._posterior, None
 
 
 def plot_prior_samples(bnn: BayesianNeuralNetwork, data: Data, ndraws=15, nsamples=400, fig=None, ax=None):
