@@ -37,15 +37,15 @@ class BayesianNeuralNetwork(ABC):
 
 class BNNRegressor(BayesianNeuralNetwork):
     def __init__(self, nonlin: Callable[[jax.Array], jax.Array], D_X: int, D_Y: int, D_H: list[int], biases: bool,
-                 obs_model: str | float = "loc_scale", prior_scale: float = 1.0, prior_type: str = "iid",
-                 beta: float = 1.0):
+                 obs_model: str | float = "loc_scale", prior_scale: float = np.sqrt(2), prior_type: str = "xavier",
+                 beta: float = 1.0, scale_nonlin: Callable = lambda xs: jax.nn.softplus(xs) + 1e-2):
         """ :param obs_model: float: precision of Gaussian / "loc_scale": predict both / "inv_gamma": Gamma
             hyper-prior on precision / "classification" for softmax classifier on D_Y classes
         """
         super().__init__(beta)
         self._nonlin = nonlin
         # map scales into R+ using softplus ie log(1+exp(.))
-        self._scale_nonlin = lambda xs: jax.nn.softplus(xs) + 1e-2  # Add eps so lik doesn't vanish
+        self._scale_nonlin = scale_nonlin  # lambda xs: jax.nn.softplus(xs)*0.1 + 1e-2  # Add eps so lik doesn't vanish
         self.D_X = D_X
         self.D_Y = D_Y
         self.D_H = D_H

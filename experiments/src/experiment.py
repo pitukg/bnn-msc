@@ -1,5 +1,6 @@
 __all__ = [
     "Experiment",
+    "PriorExperiment",
     "BasicHMCExperiment",
     "AutoDeltaVIExperiment",
     "AutoMeanFieldNormalVIExperiment",
@@ -62,7 +63,8 @@ class Experiment(ABC):
     def make_predictions(self, rng_key_predict: random.PRNGKey):
         pass
 
-    def make_plots(self, fig=None, ax=None, plot_bald=False, legend=False, **kwargs) -> plt.Figure:
+    def make_plots(self, fig=None, ax=None, plot_bald=False, plot_samples=False, legend=False,
+                   num_extend_samples=100, **kwargs) -> plt.Figure:
         assert self._predictions is not None
         X, Y = self._data.train
         X_test, _ = self._data.test
@@ -72,19 +74,36 @@ class Experiment(ABC):
 
         if self._bnn.OBS_MODEL != "classification":
             # compute mean prediction and confidence interval around median
-            Y_mean_pred, Y_pred = self._predictions["Y_mean"][..., 0], self._predictions["Y"][..., 0]
+            Y_mean_pred = self._predictions["Y_mean"]
+            Y_scale = self._predictions["Y_scale"]
+            z = np.random.randn(*(jnp.shape(Y_mean_pred)[:-1] + (num_extend_samples,)))
+            extended_samples = Y_mean_pred + jnp.multiply(Y_scale, z)
+            Y_pred = jnp.concatenate(jnp.swapaxes(extended_samples, axis1=1, axis2=2), axis=0)
+            Y_mean_pred = Y_mean_pred[..., 0]
             mean_means = jnp.mean(Y_mean_pred, axis=0)
             mean_percentiles = np.percentile(Y_mean_pred, [5.0, 95.0], axis=0)
             Y_percentiles = np.percentile(Y_pred, [5.0, 95.0], axis=0)
+            # Plot uncertainty regions
+            ax.fill_between(X_test[:, 1], *mean_percentiles, color="#ffae22", alpha=0.5, label="90% HPDI on mean")
+            ax.fill_between(X_test[:, 1], Y_percentiles[0], mean_percentiles[0], color="#2273ff", alpha=0.5, label="90% HPDI on prediction")
+            ax.fill_between(X_test[:, 1], mean_percentiles[1], Y_percentiles[1], color="#2273ff", alpha=0.5)
+            if plot_samples:
+                # Plot function draws from Y_mean
+                label_flag = True
+                for i in range(-30, 0, 2):  # Plot from last => mixes in case of HMC
+                    label = "Posterior function draws" if label_flag else None
+                    label_flag = False
+                    ax.plot(X_test[:, 1], Y_mean_pred[i], color="black", linewidth=0.5, alpha=0.3, label=label)
+            # plot mean
+            ax.plot(X_test[:, 1], mean_means, color="darkblue", linewidth=1.5, label="Posterior mean")
             # plot training data
             ax.plot(X[:, 1], Y[:, 0], "kx")
-            # plot predictions & quantiles
-            ax.plot(X_test[:, 1], mean_means, color="blue", label="Posterior mean")
-            ax.fill_between(X_test[:, 1], *mean_percentiles, color="orange", alpha=0.5, label="90% CI on mean")
-            ax.fill_between(X_test[:, 1], *Y_percentiles, color="lightgreen", alpha=0.5, label="90% prediction")
             if plot_bald:
+                raise NotImplementedError()  # Shouldn't mix axis units
                 bald_scores = self.compute_test_bald_scores()
                 ax.plot(X_test[:, 1], bald_scores, color="black", alpha=0.6, label="BALD score")
+            ax.set_xlabel("x")
+            ax.set_ylabel("y")
             if legend:
                 ax.legend()
         else:
@@ -187,10 +206,21 @@ class SequentialExperimentBlock(Experiment):
         assert jnp.shape(samples) == (num_samples, self._bnn.get_weight_dim())
         return {'w': samples}
 
-    # TODO: in general we can't compute this integral yeah? but eg constant prec normal obs & normal w-post. we can
-    # TODO: o/w we resort to sampling posterior and logexpsum approx?
-    # def test_loglik(self) -> float:
-    #     raise NotImplementedError()
+
+class PriorExperiment(Experiment):
+    def train(self, rng_key_train: random.PRNGKey):
+        pass
+
+    def make_predictions(self, rng_key_predict: random.PRNGKey):
+        predictive = Predictive(self._bnn, num_samples=self.num_samples)
+        self._predictions = predictive(rng_key_predict, X=self._data.test[0], Y=None)
+
+    def get_posterior_samples(self, **kwargs) -> dict:
+        return {'w': self._predictions['w']}
+
+    def __init__(self, bnn: BayesianNeuralNetwork, data: Data, num_samples: int = 400):
+        super().__init__(bnn, data)
+        self.num_samples = num_samples
 
 
 class BasicHMCExperiment(Experiment):
@@ -298,12 +328,12 @@ class EvalLoss:
                             elbo_kl = elbo_kl + jnp.sum(kl_qp)
                             # elbo_lik = elbo_lik - jnp.sum(kl_qp)
                         except NotImplementedError:
-                            raise NotImplementedError()
-                        #     elbo_particle = (
-                        #             elbo_particle
-                        #             + numpyro.infer.elbo._get_log_prob_sum(model_site)
-                        #             - numpyro.infer.elbo._get_log_prob_sum(guide_site)
-                        #     )
+                            # raise NotImplementedError()
+                            elbo_kl = (
+                                    elbo_kl
+                                    + numpyro.infer.elbo._get_log_prob_sum(guide_site)
+                                    - numpyro.infer.elbo._get_log_prob_sum(model_site)
+                            )
 
             # handle auxiliary sites in the guide
             for name, site in guide_trace.items():
@@ -507,9 +537,13 @@ class AutoMeanFieldNormalVIExperiment(BasicVIExperiment):
 class AutoDeltaVIExperiment(BasicVIExperiment):
     def __init__(self, bnn: BayesianNeuralNetwork, data: Data, max_iter: int = 150_000,
                  lr_schedule: optax.Schedule = optax.constant_schedule(-0.001), num_samples: int = 200):
-        # Things are deterministic -> single sample enough for loss
+        # If KL computed analytically, things are deterministic -> single sample enough for loss
+        # Hack for SWAG posterior:
+        num_particles = 1
+        if isinstance(bnn.prior[0], dist.LowRankMultivariateNormal):
+            num_particles = 256
         super().__init__(bnn, data, num_samples=num_samples, max_iter=max_iter, lr_schedule=lr_schedule,
-                         num_particles=1, num_eval_particles=1)
+                         num_particles=num_particles, num_eval_particles=num_particles)
 
     def _get_guide(self) -> Callable:
         bnn_weight_dim = self._bnn.get_weight_dim()
@@ -588,7 +622,7 @@ class AutoFullRankLaplaceExperiment(BasicVIExperiment):
     def _get_guide(self) -> Callable:
         self._guide = autoguide.AutoLaplaceApproximation(
             self._bnn, init_loc_fn=init_loc_fn,
-            hessian_fn=lambda f, x: jax.hessian(f)(x) + jnp.eye(x.shape[-1]) * self._shrink
+            hessian_fn=lambda f, x: (jax.hessian(f)(x) + jnp.eye(x.shape[-1]) * self._shrink) * self._data.train[0].shape[0]
         )
         return self._guide
 
@@ -682,6 +716,7 @@ class AutoDiagonalLaplaceExperiment(SequentialExperimentBlock):
                     " the MAP point). Please consider using an AutoNormal guide.",
                     stacklevel=numpyro.util.find_stack_level(),
                 )
+        print(f"Laplace mean % = {jnp.isnan(scale).mean()}")
         scale = jnp.where(jnp.isnan(scale), 0.0, scale)
         loc = self._map_experiment._params["w_loc"]
         self._posterior = dist.Normal(loc, scale).to_event(1)
@@ -775,7 +810,7 @@ class SWAGExperiment(SequentialExperimentBlock):
         return experiment
 
 
-def plot_prior_samples(bnn: BayesianNeuralNetwork, data: Data, ndraws=15, nsamples=400, fig=None, ax=None):
+def plot_prior_samples(bnn: BayesianNeuralNetwork, data: Data, ndraws=15, nsamples=400, fig=None, ax=None, legend=False):
     if fig is None or ax is None:
         fig, ax = plt.subplots()
     t = data.test[0][:, 1]
@@ -784,13 +819,40 @@ def plot_prior_samples(bnn: BayesianNeuralNetwork, data: Data, ndraws=15, nsampl
         # for _ in range(nsamples):
         #     prior_fn = handlers.trace(bnn).get_trace(X=data.test[0], Y=None)
         #     mu = prior_fn['Y_mean']['value'].squeeze()
-        for _ in range(ndraws):
+        for idraw in range(ndraws):
             prior_fn = handlers.trace(bnn).get_trace(X=data.test[0], Y=None)
             mu = prior_fn['Y_mean']['value'].squeeze()
             sigma = prior_fn['Y_scale']['value'].squeeze() if 'Y_scale' in prior_fn.keys() else \
                 prior_fn['sigma_obs']['value']
-            ax.plot(t, mu)
-            ax.fill_between(t, mu - sigma, mu + sigma, alpha=0.05)
+            mu_label = "Posterior function draws" if idraw == 0 else None
+            ax.plot(t, mu, label=mu_label)
+            std_label = "+- stds of observation" if idraw == 0 else None
+            ax.fill_between(t, mu - sigma, mu + sigma, alpha=0.15, label=std_label)
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+
+    if legend:
+        from matplotlib.patches import Patch
+        from matplotlib.lines import Line2D
+        from matplotlib.legend_handler import HandlerTuple, HandlerLine2D
+        legend_elements = [(
+            (
+                Line2D([0], [0], color='blue', lw=1),
+                Patch(facecolor='blue', lw=0, alpha=0.1)
+            ),
+            (
+                Line2D([0], [0], color='orange', lw=1),
+                Patch(facecolor='orange', lw=0, alpha=0.1)
+            ),
+            Line2D([0], [0], color='black', lw=0, marker='o', markerfacecolor='black', markersize=0.5),
+        )]
+        handler_map = {
+            legend_elements[0]: HandlerTuple(ndivide=3, pad=None),
+            Line2D: HandlerLine2D(marker_pad=0.05, numpoints=3)
+        }
+        leg = ax.legend(legend_elements, ['Function draws (mean+-std)'], handler_map=handler_map)
+        leg._legend_elements_arg = legend_elements
+
     return fig
 
 

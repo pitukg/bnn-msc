@@ -85,12 +85,14 @@ class PermutedData(Data):
 # Define toy regression problem
 # create artificial regression dataset
 class ToyData1(Data):
-    def __init__(self, D_X: int = 3, sigma_obs: float = 0.05, train_size: int = 50, test_size: int = 500):
-        self.D_X = D_X
+    def __init__(self, gen_D_X: int = 3, feat_D_X = 2, sigma_obs: float = 0.05, train_size: int = 50, test_size: int = 500):
+        assert feat_D_X >= 2
+        self.gen_D_X = gen_D_X
+        self.feat_D_X = feat_D_X
         self.sigma_obs = sigma_obs
         D_Y = 1  # create 1d outputs
         np.random.seed(0)
-        self.W = 0.5 * np.random.randn(D_X)
+        self.W = 0.5 * np.random.randn(gen_D_X)
         X = jnp.concatenate((jnp.linspace(-1, -0.4, train_size // 2),
                              jnp.linspace(0.4, 1, train_size - (train_size // 2))))
         X = self._feature_expand(X)
@@ -100,7 +102,7 @@ class ToyData1(Data):
         self._div_std = jnp.std(Y)
         Y = self._scale(Y)
 
-        assert X.shape == (train_size, D_X)
+        assert X.shape == (train_size, feat_D_X)
         assert Y.shape == (train_size, D_Y)
 
         X_test = jnp.linspace(-3., 3., test_size)
@@ -111,13 +113,25 @@ class ToyData1(Data):
         self._X_test = X_test
         self._Y_test = None
 
-    def _feature_expand(self, X: jax.Array):
-        return jnp.power(X[:, np.newaxis], jnp.arange(self.D_X))  # XXX ?bias included in model
+    def _feature_expand(self, X: jax.Array, length_scale=1.0):
+        if self.feat_D_X == 2:
+            # Hack so that this input dimension has no effect on anything
+            # we rely on true x being second coordinate
+            return jnp.hstack((jnp.zeros((X.shape[0], 1,)), X[:, np.newaxis],))
+        np.random.seed(0)
+        omega = np.random.randn(self.feat_D_X) / length_scale
+        b = np.random.uniform(low=0., high=2.*np.pi, size=self.feat_D_X)
+        expanded_X = jnp.cos(jnp.add(jnp.outer(X, omega), b)) * jnp.sqrt(2.)
+        expanded_X = expanded_X.at[:, 1].set(X)
+        return expanded_X
 
     def _get_unscaled_mean(self, X: jax.Array):
         # X should be feature-expanded already
         # y = w0 + w1*x + w2*x**2 + 1/2 (1/2+x)**2 * sin(4x)
-        Y = jnp.dot(X, self.W) + 0.5 * jnp.power(0.5 + X[:, 1], 2.0) * jnp.sin(4.0 * X[:, 1])
+        t = X[:, 1]
+        underlying_X = jnp.power(t[:, np.newaxis], jnp.arange(self.gen_D_X))
+        Y = jnp.dot(underlying_X, self.W) + 0.5 * jnp.power(0.5 + t, 2.0) * jnp.sin(4.0 * t)
+        # Y = jnp.dot(X[:, :(min(3, self.D_X))], self.W) + 0.5 * jnp.power(0.5 + X[:, 1], 2.0) * jnp.sin(4.0 * X[:, 1])
         Y = Y[:, np.newaxis]
         return Y
 
@@ -140,6 +154,10 @@ class ToyData1(Data):
         Y = self._scale(Y_unscaled)
         scaled_sigma_obs = self.sigma_obs / self._div_std
         return dist.Normal(Y, scale=scaled_sigma_obs)
+
+
+def FlatData():
+    return DataSlice(ToyData1(gen_D_X=2, train_size=100), slice(0, 50))
 
 
 class Sign(Data):
@@ -167,9 +185,10 @@ class Sign(Data):
 
 
 class LinearData(Data):
-    def __init__(self, intercept: float, beta: float, D_X=3, sigma_obs=0.05, train_size=50, test_size=500):
+    def __init__(self, intercept: float, beta: float, D_X=2, sigma_obs=0.05, train_size=50, test_size=500):
         self.intercept = intercept
         self.beta = beta
+        assert D_X >= 2
         self.D_X = D_X
         self.sigma_obs = sigma_obs
         D_Y = 1  # create 1d outputs
@@ -191,13 +210,23 @@ class LinearData(Data):
         self._X_test = X_test
         self._Y_test = None
 
-    def _feature_expand(self, X: jax.Array):
-        return jnp.power(X[:, np.newaxis], jnp.arange(self.D_X))  # XXX ?bias included in model
+    def _feature_expand(self, X: jax.Array, length_scale=1.0):
+        if self.D_X == 2:
+            # Hack so that this input dimension has no effect on anything
+            # we rely on true x being second coordinate
+            return jnp.hstack((jnp.zeros((X.shape[0], 1,)), X[:, np.newaxis],))
+        np.random.seed(0)
+        omega = np.random.randn(self.D_X) / length_scale
+        b = np.random.uniform(low=0., high=2.*np.pi, size=self.D_X)
+        expanded_X = jnp.cos(jnp.add(jnp.outer(X, omega), b)) * jnp.sqrt(2.)
+        expanded_X = expanded_X.at[:, 1].set(X)
+        return expanded_X
 
     def _get_unscaled_mean(self, X: jax.Array):
         # X should be feature-expanded already
         # y = icpt + b*x
-        Y = jnp.dot(X, jnp.array([self.intercept, self.beta]))
+        Y = self.intercept + self.beta * X[:, 1]
+        # Y = jnp.dot(X[:, :2], jnp.array([self.intercept, self.beta]))
         Y = Y[:, np.newaxis]
         return Y
 
@@ -233,9 +262,9 @@ class ConcatData(Data):
         tests = [data.test for data in self._datas]
         Xs = [test[0] for test in tests]
         Ys = [test[1] for test in tests]
-        X = jnp.concatenate(Xs, axis=0)
-        Y = jnp.concatenate(Ys, axis=0)
-        return X, Y
+        # X = jnp.concatenate(Xs, axis=0)
+        # Y = None if any(Yi is None for Yi in Ys) else jnp.concatenate(Ys, axis=0)
+        return Xs[0], Ys[0]
 
     def true_predictive(self, X: jax.Array) -> dist.Distribution:
         raise NotImplementedError()
