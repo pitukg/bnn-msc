@@ -17,7 +17,7 @@ plt.rcParams.update({
     "axes.titlesize": 20,
     "axes.titlepad": 10.0,
     "axes.labelsize": 18,
-    "figure.constrained_layout.use": True,
+    # "figure.constrained_layout.use": True,
     "figure.titlesize": 22,
     "figure.subplot.wspace": 0.3,
     "font.size": 15,
@@ -171,5 +171,6 @@ if args.bald:
     ax_balds.legend()
 else:
     ax_prior.get_legend().remove()
+    fig.tight_layout()  # grid messes up constrained layout
 
 fig.savefig(f"figs/complexity_comparison_{args.factory}_{args.data}_{args.D_X}{'_bald' if args.bald else ''}.pdf")
