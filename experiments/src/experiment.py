@@ -2,6 +2,7 @@ __all__ = [
     "Experiment",
     "PriorExperiment",
     "BasicHMCExperiment",
+    "BasicSGLDExperiment",
     "AutoDeltaVIExperiment",
     "AutoMeanFieldNormalVIExperiment",
     "BasicMeanFieldGaussianVIExperiment",
@@ -45,6 +46,7 @@ from typing_extensions import Self
 
 from .data import Data, DataSlice
 from .model import BayesianNeuralNetwork
+from .sgld import SGLD
 
 
 class Experiment(ABC):
@@ -225,11 +227,13 @@ class PriorExperiment(Experiment):
 
 class BasicHMCExperiment(Experiment):
     def __init__(self, bnn: BayesianNeuralNetwork, data: Data, init_params: Optional[dict] = None,
-                 num_samples: int = 2_000, num_warmup: int = 1_000, num_chains: int = 1, group_by_chain: bool = False):
+                 num_samples: int = 2_000, num_warmup: int = 1_000, thinning=1,
+                 num_chains: int = 1, group_by_chain: bool = False):
         super().__init__(bnn, data)
         self._init_params = init_params
         self._num_samples = num_samples
         self._num_warmup = num_warmup
+        self._thinning = thinning
         self._num_chains = num_chains
         self._group_by_chain = group_by_chain
         # Initialise state
@@ -238,15 +242,19 @@ class BasicHMCExperiment(Experiment):
             (num_chains, 0, self._bnn.get_weight_dim(),)
         self._samples: dict = dict(w=jnp.empty(samples_init_shape))
 
+    def _get_kernel(self):
+        return NUTS(self._bnn)
+
     def train(self, rng_key_train: random.PRNGKey, progress_bar: bool = True):
         start = time.time()
         X, Y = self._data.train
         if self._mcmc is None:
-            kernel = NUTS(self._bnn)
+            kernel = self._get_kernel()
             self._mcmc = MCMC(
                 kernel,
                 num_warmup=self._num_warmup,
                 num_samples=self._num_samples,
+                thinning=self._thinning,
                 num_chains=self._num_chains,
                 chain_method="vectorized",
                 progress_bar=False if not progress_bar or "NUMPYRO_SPHINXBUILD" in os.environ else True,
@@ -293,6 +301,32 @@ class BasicHMCExperiment(Experiment):
         if self._group_by_chain:
             raise NotImplementedError()
         return self._samples
+
+
+class BasicSGLDExperiment(BasicHMCExperiment):
+    def __init__(self, bnn: BayesianNeuralNetwork, data: Data, init_params: Optional[dict] = None,
+                 init_step_size = 0.1, final_step_size = 0.0001, num_samples: int = 10_000,
+                 num_warmup: int = 5_000, thinning: int = 5,
+                 num_chains: int = 1, group_by_chain: bool = False):
+        super().__init__(bnn, data, init_params, num_samples, num_warmup, thinning, num_chains, group_by_chain)
+        self._init_step_size = init_step_size
+        self._final_step_size = final_step_size
+
+    def _constant_lr_schedule_with_cosine_burnin(self, step):
+        """
+        Cosine LR schedule with burn-in for SG-MCMC.
+        Based on [bnn_hmc](https://github.com/google-research/google-research/tree/master/bnn_hmc).
+        """
+        t = jnp.minimum(step / self._num_warmup, 1.)
+        coef = (1 + jnp.cos(t * np.pi)) * 0.5
+        return coef * self._init_step_size + (1 - coef) * self._final_step_size
+
+    def _get_kernel(self):
+        return SGLD(
+            self._bnn,
+            init_strategy=numpyro.infer.init_to_sample,
+            step_size_fn=lambda _: self._constant_lr_schedule_with_cosine_burnin,
+        )
 
 
 class EvalLoss:

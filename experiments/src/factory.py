@@ -3,6 +3,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+from typing import List
 
 from jax import random
 
@@ -25,7 +26,7 @@ class factory:
         raise NotImplementedError()
 
     @classmethod
-    def hmc(cls, bnn: BNNRegressor, data: Data, trained_map_experiments: list[AutoDeltaVIExperiment]) -> BasicHMCExperiment:
+    def hmc(cls, bnn: BNNRegressor, data: Data, trained_map_experiments: List[AutoDeltaVIExperiment]) -> BasicHMCExperiment:
         raise NotImplementedError()
 
     @classmethod
@@ -36,6 +37,19 @@ class factory:
             return delta
         deltas = [train_delta(rng_key) for rng_key in random.split(random.PRNGKey(0), num=cls.HMC_NUM_CHAINS)]
         return cls.hmc(bnn, data, deltas)
+
+    @classmethod
+    def sgld(cls, bnn: BNNRegressor, data: Data, trained_map_experiments: list[AutoDeltaVIExperiment], step_size=0.0001) -> BasicSGLDExperiment:
+        raise NotImplementedError()
+
+    @classmethod
+    def map_then_sgld(cls, bnn: BNNRegressor, data: Data) -> BasicHMCExperiment:
+        def train_delta(rng_key):
+            delta = cls.map(bnn, data)
+            delta.train(rng_key)
+            return delta
+        deltas = [train_delta(rng_key) for rng_key in random.split(random.PRNGKey(0), num=cls.HMC_NUM_CHAINS)]
+        return cls.sgld(bnn, data, deltas)
 
     @classmethod
     def mfvi(cls, bnn: BNNRegressor, data: Data) -> BasicMeanFieldGaussianVIExperiment:
@@ -102,6 +116,21 @@ class small(factory):
     @classmethod
     def map_then_hmc(cls, bnn: BNNRegressor, data: Data) -> BasicHMCExperiment:
         return super().map_then_hmc(bnn, data)
+
+    @classmethod
+    def sgld(cls, bnn: BNNRegressor, data: Data, trained_map_experiments: list[AutoDeltaVIExperiment], step_size=1e-5) -> BasicSGLDExperiment:
+        assert len(trained_map_experiments) == cls.HMC_NUM_CHAINS
+        init_params = jnp.array([delta._params["w_loc"] for delta in trained_map_experiments])
+        return BasicSGLDExperiment(
+            bnn, data,
+            init_params={"w": init_params},
+            init_step_size=2*step_size,
+            final_step_size=step_size,
+            thinning=250,
+            num_warmup=50_000,
+            num_samples=100_000,
+            num_chains=cls.HMC_NUM_CHAINS,
+        )
 
     @classmethod
     def diag_laplace(cls, bnn: BNNRegressor, data: Data, trained_map_experiment: AutoDeltaVIExperiment) -> AutoDiagonalLaplaceExperiment:
@@ -180,6 +209,21 @@ class big(factory):
     @classmethod
     def map_then_hmc(cls, bnn: BNNRegressor, data: Data) -> BasicHMCExperiment:
         return super().map_then_hmc(bnn, data)
+
+    @classmethod
+    def sgld(cls, bnn: BNNRegressor, data: Data, trained_map_experiments: list[AutoDeltaVIExperiment], step_size=5e-7) -> BasicSGLDExperiment:
+        assert len(trained_map_experiments) == cls.HMC_NUM_CHAINS
+        init_params = jnp.array([delta._params["w_loc"] for delta in trained_map_experiments])
+        return BasicSGLDExperiment(
+            bnn, data,
+            init_params={"w": init_params},
+            init_step_size=2*step_size,
+            final_step_size=step_size,
+            thinning=250,
+            num_warmup=50_000,
+            num_samples=100_000,
+            num_chains=cls.HMC_NUM_CHAINS,
+        )
 
     @classmethod
     def diag_laplace(cls, bnn: BNNRegressor, data: Data, trained_map_experiment: AutoDeltaVIExperiment) -> AutoDiagonalLaplaceExperiment:
