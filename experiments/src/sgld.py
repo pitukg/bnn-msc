@@ -179,7 +179,7 @@ def euler_integrator(
         if forward_mode_differentiation:
             grad_potential = jax.jacfwd(potential_fn)(u)
         else:
-            grad_potential = jax.grad(potential_fn)(u)
+            grad_potential = jax.grad(potential_fn)(u)#['w'].val
         grad_log_posterior = jax.tree.map(lambda x: -x, grad_potential)  # ∇ log π
 
         # Apply Optax SGLD update

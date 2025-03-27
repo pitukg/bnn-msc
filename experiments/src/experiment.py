@@ -9,6 +9,7 @@ __all__ = [
     "BasicMeanFieldGaussianVIExperiment",
     "BasicFullRankGaussianVIExperiment",
     "AutoFullRankLaplaceExperiment",
+    "AutoFullRankLaplaceExperiment2",
     "AutoDiagonalLaplaceExperiment",
     "SWAGExperiment",
     "SequentialExperiment",
@@ -33,6 +34,7 @@ import numpy as np
 import numpyro
 import numpyro.distributions as dist
 import optax
+import optax.second_order
 import optax_swag
 import tqdm
 from jax import lax, vmap
@@ -67,7 +69,7 @@ class Experiment(ABC):
         pass
 
     def make_plots(self, fig=None, ax=None, plot_bald=False, plot_samples=False, legend=False,
-                   num_extend_samples=100, **kwargs) -> plt.Figure:
+                   num_extend_samples=100, xlabel=True, ylabel=True, **kwargs) -> plt.Figure:
         assert self._predictions is not None
         X, Y = self._data.train
         X_test, _ = self._data.test
@@ -101,7 +103,7 @@ class Experiment(ABC):
                 for i in range(-30, 0, 2):  # Plot from last => mixes in case of HMC
                     label = "Posterior function draws" if label_flag else None
                     label_flag = False
-                    ax.plot(X_test[:, 1], Y_mean_pred[i], color="black", linewidth=0.5, alpha=0.3, label=label)
+                    ax.plot(X_test[:, 1], Y_mean_pred[i], color="black", linewidth=0.5, alpha=0.8, label=label)
             # plot mean
             ax.plot(X_test[:, 1], mean_means, color="darkblue", linewidth=1.5, label="Posterior mean")
             # plot training data
@@ -110,8 +112,10 @@ class Experiment(ABC):
                 raise NotImplementedError()  # Shouldn't mix axis units
                 bald_scores = self.compute_test_bald_scores()
                 ax.plot(X_test[:, 1], bald_scores, color="black", alpha=0.6, label="BALD score")
-            ax.set_xlabel("x")
-            ax.set_ylabel("y")
+            if xlabel:
+                ax.set_xlabel("x")
+            if ylabel:
+                ax.set_ylabel("y")
             if legend:
                 ax.legend()
         else:
@@ -569,13 +573,19 @@ class BasicVIExperiment(SequentialExperimentBlock):
 
 
 class BasicMeanFieldGaussianVIExperiment(BasicVIExperiment):
+    def __init__(self, bnn: BayesianNeuralNetwork, data: Data, num_samples: int = 2_000,
+                 max_iter: int = 150_000, lr_schedule: optax.Schedule = optax.constant_schedule(-0.001),
+                 num_particles: int = 16, num_eval_particles: int = 128, init_scale: float = 1e-5):
+        super(BasicMeanFieldGaussianVIExperiment, self).__init__(bnn,data, num_samples, max_iter, lr_schedule, num_particles, num_eval_particles)
+        self.init_scale = init_scale
+
     def _get_guide(self) -> Callable[[jnp.ndarray, Optional[jnp.ndarray]], Any]:
         bnn_weight_dim = self._bnn.get_weight_dim()
         bnn_weight_prior = self._bnn.prior[0]
 
         def guide(X, Y=None):
             w_loc = numpyro.param("w_loc", lambda rng_key: bnn_weight_prior.sample(rng_key))
-            w_scale = numpyro.param("w_scale", jnp.full((bnn_weight_dim,), 1e-5),
+            w_scale = numpyro.param("w_scale", jnp.full((bnn_weight_dim,), self.init_scale),
                                     constraint=constraints.softplus_positive)
             with handlers.scale(scale=self._bnn.BETA):
                 numpyro.sample("w", dist.Normal(w_loc, w_scale).to_event(1))
@@ -716,7 +726,7 @@ class AutoFullRankLaplaceExperiment(BasicVIExperiment):
         X_test, _ = self._data.test
         posterior = self._guide.get_posterior(self._params)
         samples = posterior.sample(rng_key_predict, sample_shape=(self._num_samples,))
-        predictive = Predictive(model=self._bnn, posterior_samples={'w': samples})
+        predictive = Predictive(model=self._bnn, posterior_samples={'w': samples[:, :-1]})
         self._predictions = predictive(rng_key_predict, X=X_test, Y=None)  # ['Y'][..., 0]
 
 
@@ -786,7 +796,12 @@ class AutoDiagonalLaplaceExperiment(SequentialExperimentBlock):
             return loss.loss(rng_key, params, self._bnn, self._map_experiment._guide, X=inputs, Y=targets)
 
         X, Y = self._data.train
-        precision = optax.fisher_diag(negative_loglik, self._map_experiment._params, X, Y)
+        # precision = optax.second_order.fisher_diag(negative_loglik, self._map_experiment._params, X, Y)
+        # precision = precision[:-1]
+        precision = jax.hessian(negative_loglik)(self._map_experiment._params, X, Y)
+        precision = jnp.diag(precision['w_loc']['w_loc'])
+        # precision = optax.second_order.hessian_diag(negative_loglik, self._map_experiment._params, X, Y)
+        # precision = precision[1:]
         precision += self._shrink
         scale = 1. / jnp.sqrt(precision)
         if numpyro.util.not_jax_tracer(scale):
@@ -826,6 +841,34 @@ class AutoDiagonalLaplaceExperiment(SequentialExperimentBlock):
         # Make sure state is initialised
         experiment._map_experiment.train(random.PRNGKey(0), num_iter=0)
         return experiment
+
+
+class AutoFullRankLaplaceExperiment2(AutoDiagonalLaplaceExperiment):
+    def train(self, rng_key_train: random.PRNGKey):
+        loss = TraceMeanField_ELBO(num_particles=1)
+        rng_key = random.PRNGKey(0)
+
+        def negative_loglik(params, inputs, targets):
+            return loss.loss(rng_key, params, self._bnn, self._map_experiment._guide, X=inputs, Y=targets)
+
+        X, Y = self._data.train
+        # precision = optax.second_order.fisher_diag(negative_loglik, self._map_experiment._params, X, Y)
+        precision = jax.hessian(negative_loglik)(self._map_experiment._params, X, Y)
+        precision = precision['w_loc']['w_loc']
+        precision += self._shrink*jnp.eye(precision.shape[0])
+        cov = jnp.linalg.inv(precision)
+        if numpyro.util.not_jax_tracer(cov):
+            if np.any(np.isnan(cov)):
+                warnings.warn(
+                    "Hessian of log posterior at the MAP point is singular. Posterior"
+                    " samples from AutoLaplaceApproxmiation will be constant (equal to"
+                    " the MAP point). Please consider using an AutoNormal guide.",
+                    stacklevel=numpyro.util.find_stack_level(),
+                )
+        print(f"Laplace mean % = {jnp.isnan(cov).mean().mean()}")
+        cov = jnp.where(jnp.isnan(cov), 0.0, cov)
+        loc = self._map_experiment._params["w_loc"]
+        self._posterior = dist.MultivariateNormal(loc, cov)
 
 
 class SWAGExperiment(SequentialExperimentBlock):

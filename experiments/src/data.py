@@ -275,22 +275,25 @@ class GPData(Data):
              sigma_obs: float = 0.1,
              train_size: int = 50,
              test_size: int = 500,
-             rff_features: int = 100):
+             rff_full_features: int = 500,
+             rff_features: int = 20):
         # Kernel parameters
         self.length_scale = length_scale
         self.sigma_obs = sigma_obs
+        self.rff_full_features = rff_full_features
         self.rff_features = rff_features
 
-        # Generate train points in [-3, -1.5) and [1.5, 3)
-        train_part1 = jnp.linspace(-3, -1.5, num=train_size//2, endpoint=False)
-        train_part2 = jnp.linspace(1.5, 3, num=train_size - train_size//2, endpoint=False)
+        THOLD =2
+        # Generate train points in [-3, -THOLD) and [THOLD, 3)
+        train_part1 = jnp.linspace(-3, -THOLD, num=train_size//2, endpoint=False)
+        train_part2 = jnp.linspace(THOLD, 3, num=train_size - train_size//2, endpoint=False)
         raw_train_x = jnp.concatenate([train_part1, train_part2])
 
-        # Generate test points in [-6, -3), [-1.5, 1.5), and [3, 6]
+        # Generate test points in [-6, -3), [-THOLD, THOLD), and [3, 6]
         test_part_size = test_size // 3
         remainder = test_size % 3
         test_part1 = jnp.linspace(-6, -3, num=test_part_size + (remainder > 0), endpoint=False)
-        test_part2 = jnp.linspace(-1.5, 1.5, num=test_part_size + (remainder > 1), endpoint=False)
+        test_part2 = jnp.linspace(-THOLD, THOLD, num=test_part_size + (remainder > 1), endpoint=False)
         test_part3 = jnp.linspace(3, 6, num=test_part_size, endpoint=False)
         raw_test_x = jnp.concatenate([test_part1, train_part1, test_part2, train_part2, test_part3])
         train_mask = jnp.concatenate([jnp.zeros_like(test_part1), jnp.ones_like(train_part1), jnp.zeros_like(test_part2),
@@ -302,7 +305,8 @@ class GPData(Data):
         self._K = K
 
         # Sample function values from GP prior
-        f_full = np.random.multivariate_normal(mean=np.zeros(K.shape[0]), cov=K)
+        np.random.seed(0)
+        f_full = jnp.array(np.random.multivariate_normal(mean=np.zeros(K.shape[0]), cov=K))
 
         # Split into train/test
         self._f_train = f_full[train_mask]
@@ -316,11 +320,11 @@ class GPData(Data):
         self._Y_test = self._Y_test[:, np.newaxis]
 
         # Initialize RFF parameters
-        np.random.seed(0)
-        self._omega = np.random.normal(0, 1/length_scale, rff_features)
-        self._b = np.random.uniform(0, 2*np.pi, rff_features)
+        self._omega = np.random.normal(0, 1/length_scale, rff_full_features)
+        self._b = np.random.uniform(0, 2*np.pi, rff_full_features)
 
         # Feature-expand inputs
+        self._center_X = None
         self._X_train = self._feature_expand(raw_train_x)
         self._X_test = self._feature_expand(raw_test_x)
 
@@ -335,8 +339,80 @@ class GPData(Data):
         scaled_inputs = jnp.outer(X, self._omega)
         phases = scaled_inputs + self._b
         features = jnp.cos(phases) * jnp.sqrt(2.0 / self.rff_features)
-        features = features.at[:, 0].set(1.)
+        def get_whitening_matrix(X, epsilon=1e-5):
+            import numpy as np
+            """
+            Whitens a matrix using ZCA whitening.
+
+            Args:
+                X (np.ndarray): Input data matrix of shape (n_samples, n_features).
+                epsilon (float): Small value to avoid division by zero.
+
+            Returns:
+                np.ndarray: Whitened data matrix.
+            """
+            # 1. Mean-center the data
+            X_centered = X - np.mean(X, axis=0)
+            centering = np.mean(X, axis=0)
+
+            # 2. Compute covariance matrix
+            cov = np.cov(X_centered, rowvar=False)
+
+            # 3. Eigendecomposition
+            eigenvalues, eigenvectors = np.linalg.eigh(cov)
+
+            # 4. Construct whitening matrix
+            whitening_matrix = eigenvectors @ np.diag(1.0 / np.sqrt(eigenvalues + epsilon)) @ eigenvectors.T
+
+            # 5. Whiten the data
+            return centering, whitening_matrix
+        def select_uncorrelated_subset(cov_matrix, subset_size):
+            import numpy as onp
+            """
+            Selects a subset of dimensions with minimal maximum absolute covariance.
+
+            Args:
+                cov_matrix (np.ndarray): A 100x100 covariance matrix.
+                subset_size (int): The desired size of the subset.
+
+            Returns:
+                list: Indices of the selected subset, ordered by their selection sequence.
+            """
+            n = cov_matrix.shape[0]
+            A = onp.abs(cov_matrix.copy())
+            onp.fill_diagonal(A, 0)  # Ignore the diagonal elements (variances)
+
+            selected = []
+            remaining = list(range(n))
+
+            for _ in range(subset_size):
+                if not selected:
+                    # First selection: variable with the smallest sum of absolute covariances
+                    sums = A.sum(axis=1)
+                    min_idx = onp.argmin(sums)
+                else:
+                    # Submatrix of remaining variables vs selected variables
+                    submatrix = A[onp.ix_(remaining, selected)]
+                    # Find maximum covariance with any selected variable for each remaining
+                    max_covs = submatrix.max(axis=1)
+                    # Select the variable with the smallest maximum covariance
+                    min_idx_pos = onp.argmin(max_covs)
+                    min_idx = remaining[min_idx_pos]
+                selected.append(min_idx)
+                remaining.remove(min_idx)
+
+            return onp.array(selected)
+        if self._center_X is None:
+            self._center_X, self._whiten_X = get_whitening_matrix(features, epsilon=1e-5)
+        # if self._subidx is None:
+        #     self._subidx = jnp.concatenate([
+        #         jnp.array([0, 1]),
+        #         2+select_uncorrelated_subset(features[:, 2:].T @ features[:, 2:], subset_size=self.rff_features),
+        #     ])
+        # features = features.at[:, 0].set(1.)
+        # features = (features - self._center_X) @ self._whiten_X
         features = features.at[:, 1].set(X)
+        # features = features[:, self._subidx]
         return features
 
     @property
