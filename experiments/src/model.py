@@ -195,3 +195,42 @@ class BNNRegressor(BayesianNeuralNetwork):
         cpy._prior_w = prior_w
         cpy._prior_prec_obs = prior_prec_obs
         return cpy
+
+
+class BayesianLinearRegression(BNNRegressor):
+    """Bayesian linear regression with fixed observation noise and Gaussian prior on weights."""
+    def __init__(self,
+                 input_dim: int,
+                 noise_scale: float,
+                 prior_scale: float = 1.0,
+                 beta: float = 1.0):
+        """
+        :param input_dim: Dimension of input features (D_X)
+        :param noise_scale: Fixed observation noise standard deviation (σ)
+        :param prior_scale: Scale parameter for diagonal prior covariance
+        :param beta: Temperature for prior scaling
+        """
+        super().__init__(
+            nonlin=lambda x: x,  # Linear activation (identity function)
+            D_X=input_dim,
+            D_Y=1,  # Single output dimension
+            D_H=[],  # No hidden layers -> linear regression
+            biases=False,  # Include bias term (intercept)
+            obs_model=noise_scale**-2,  # Fixed precision = 1/σ²
+            prior_scale=prior_scale,
+            prior_type="iid",  # Independent normal prior
+            beta=beta,
+            scale_nonlin=lambda x: x  # No scaling needed for linear output
+        )
+        self._prior_w = dist.MultivariateNormal(
+            self._prior_w.mean,
+            jnp.diag(self._prior_w.variance)
+        )
+
+    # Optional: Add convenience methods specific to linear regression
+    def get_coefficients(self, samples: dict) -> tuple[jax.Array, jax.Array]:
+        """Extract weights and bias from posterior samples"""
+        w_samples = samples["w"]
+        weights = jnp.array([self._wi_from_flat(w, 0) for w in w_samples])
+        bias = jnp.array([self._wi_from_flat(w, 0, bias=True) for w in w_samples])
+        return weights.squeeze(), bias.squeeze()

@@ -268,3 +268,91 @@ class ConcatData(Data):
 
     def true_predictive(self, X: jax.Array) -> dist.Distribution:
         raise NotImplementedError()
+
+
+class GPData(Data):
+    def __init__(self, length_scale: float = 1.0,
+             sigma_obs: float = 0.1,
+             train_size: int = 50,
+             test_size: int = 500,
+             rff_features: int = 100):
+        # Kernel parameters
+        self.length_scale = length_scale
+        self.sigma_obs = sigma_obs
+        self.rff_features = rff_features
+
+        # Generate train points in [-3, -1.5) and [1.5, 3)
+        train_part1 = jnp.linspace(-3, -1.5, num=train_size//2, endpoint=False)
+        train_part2 = jnp.linspace(1.5, 3, num=train_size - train_size//2, endpoint=False)
+        raw_train_x = jnp.concatenate([train_part1, train_part2])
+
+        # Generate test points in [-6, -3), [-1.5, 1.5), and [3, 6]
+        test_part_size = test_size // 3
+        remainder = test_size % 3
+        test_part1 = jnp.linspace(-6, -3, num=test_part_size + (remainder > 0), endpoint=False)
+        test_part2 = jnp.linspace(-1.5, 1.5, num=test_part_size + (remainder > 1), endpoint=False)
+        test_part3 = jnp.linspace(3, 6, num=test_part_size, endpoint=False)
+        raw_test_x = jnp.concatenate([test_part1, train_part1, test_part2, train_part2, test_part3])
+        train_mask = jnp.concatenate([jnp.zeros_like(test_part1), jnp.ones_like(train_part1), jnp.zeros_like(test_part2),
+                                      jnp.ones_like(train_part2), jnp.zeros_like(test_part3)]).astype(bool)
+
+        # Combine all points for GP sampling
+        X_full = raw_test_x
+        K = self._se_kernel(X_full, X_full)
+        self._K = K
+
+        # Sample function values from GP prior
+        f_full = np.random.multivariate_normal(mean=np.zeros(K.shape[0]), cov=K)
+
+        # Split into train/test
+        self._f_train = f_full[train_mask]
+        self._f_test = f_full
+
+        # Add noise only to train observations
+        noise = np.random.normal(0, sigma_obs, size=train_size)
+        self._Y_train = self._f_train + noise
+        self._Y_train = self._Y_train[:, np.newaxis]
+        self._Y_test = self._f_test  # No noise for test
+        self._Y_test = self._Y_test[:, np.newaxis]
+
+        # Initialize RFF parameters
+        np.random.seed(0)
+        self._omega = np.random.normal(0, 1/length_scale, rff_features)
+        self._b = np.random.uniform(0, 2*np.pi, rff_features)
+
+        # Feature-expand inputs
+        self._X_train = self._feature_expand(raw_train_x)
+        self._X_test = self._feature_expand(raw_test_x)
+
+    def _se_kernel(self, x1: jax.Array, x2: jax.Array) -> jax.Array:
+        """Squared exponential kernel matrix"""
+        dists = jnp.subtract.outer(x1, x2)
+        return jnp.exp(-0.5 * (dists ** 2) / (self.length_scale ** 2))
+
+    def _feature_expand(self, X: jax.Array) -> jax.Array:
+        """RFF expansion matching the SE kernel"""
+        # Use precomputed omega and b
+        scaled_inputs = jnp.outer(X, self._omega)
+        phases = scaled_inputs + self._b
+        features = jnp.cos(phases) * jnp.sqrt(2.0 / self.rff_features)
+        features = features.at[:, 0].set(1.)
+        features = features.at[:, 1].set(X)
+        return features
+
+    @property
+    def train(self) -> tuple[jax.Array, jax.Array]:
+        return self._X_train, self._Y_train
+
+    @property
+    def test(self) -> tuple[jax.Array, jax.Array]:
+        return self._X_test, self._Y_test
+
+    def true_predictive(self, X: jax.Array) -> dist.Distribution:
+        """Returns the true noise distribution around the function"""
+        raise NotImplementedError()
+        # Feature-expand inputs
+        X_expanded = self._feature_expand(X)
+
+        # Compute true function values (would need to recompute covariance)
+        # For simplicity, we'll return the observation distribution
+        return dist.Normal(loc=0, scale=self.sigma_obs).expand([X.shape[0]])

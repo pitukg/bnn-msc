@@ -1,6 +1,7 @@
 __all__ = [
     "Experiment",
     "PriorExperiment",
+    "TrueBayesianLinearRegressionExperiment",
     "BasicHMCExperiment",
     "BasicSGLDExperiment",
     "AutoDeltaVIExperiment",
@@ -45,7 +46,7 @@ from scipy import stats
 from typing_extensions import Self
 
 from .data import Data, DataSlice
-from .model import BayesianNeuralNetwork
+from .model import BayesianNeuralNetwork, BayesianLinearRegression
 from .sgld import SGLD
 
 
@@ -77,7 +78,12 @@ class Experiment(ABC):
         if self._bnn.OBS_MODEL != "classification":
             # compute mean prediction and confidence interval around median
             Y_mean_pred = self._predictions["Y_mean"]
-            Y_scale = self._predictions["Y_scale"]
+            if self._bnn.OBS_MODEL == "const_prec":
+                Y_scale = self._predictions["sigma_obs"]
+                assert jnp.all(Y_scale[0] == Y_scale)
+                Y_scale = Y_scale[0]
+            else:
+                Y_scale = self._predictions["Y_scale"]
             z = np.random.randn(*(jnp.shape(Y_mean_pred)[:-1] + (num_extend_samples,)))
             extended_samples = Y_mean_pred + jnp.multiply(Y_scale, z)
             Y_pred = jnp.concatenate(jnp.swapaxes(extended_samples, axis1=1, axis2=2), axis=0)
@@ -223,6 +229,47 @@ class PriorExperiment(Experiment):
     def __init__(self, bnn: BayesianNeuralNetwork, data: Data, num_samples: int = 400):
         super().__init__(bnn, data)
         self.num_samples = num_samples
+
+
+class TrueBayesianLinearRegressionExperiment(SequentialExperimentBlock):
+    def __init__(self, bnn: BayesianLinearRegression, data: Data, num_samples: int = 400):
+        self._bnn: BayesianLinearRegression = bnn
+        self._data: Data = data
+        self.num_samples = num_samples
+        # Initialise state
+        self._predictions: Optional[dict] = None  # numpyro trace on data.test predictive
+        # self._predictions: Optional[jnp.ndarray] = None  # of shape (num_samples, X_test.shape[0])
+        self._bnn_post: Optional[BayesianLinearRegression] = None
+
+    def train(self, rng_key_train: random.PRNGKey):
+        X, Y = self._data.train
+        mu, V = self._bnn._prior_w.mean, self._bnn._prior_w.covariance_matrix
+        prec_obs = self._bnn._prior_prec_obs.mean
+        V_inv = jnp.linalg.inv(V)
+        V_post_inv = V_inv + prec_obs * X.T @ X
+        V_post = jnp.linalg.inv(V_post_inv)
+        mu_post = V_post @ (V_inv @ mu + prec_obs * X.T @ Y[:, 0])
+        self._bnn_post = self._bnn.with_prior(dist.MultivariateNormal(mu_post, V_post), self._bnn._prior_prec_obs)
+
+    def make_predictions(self, rng_key_predict: random.PRNGKey):
+        predictive = Predictive(self._bnn_post, num_samples=self.num_samples)
+        self._predictions = predictive(rng_key_predict, X=self._data.test[0], Y=None)
+
+    def get_posterior_samples(self, **kwargs) -> dict:
+        return {'w': self._predictions['w']}
+
+    @property
+    def posterior(self) -> tuple[dist.Distribution, Optional[dist.Distribution]]:
+        assert self._bnn_post is not None
+        # w_posterior = dist.Normal(loc=self._bnn_post._prior_w.mean, scale=self._bnn_post._prior_w.variance).to_event(1)
+        w_posterior = self._bnn_post._prior_w
+        # Note for further VI it is a problem that support(prec_obs) is a single point,
+        # therefore we mask this distribution so KL computation is ignored, and make sure to
+        # initialise the delta guide to this point!
+        prec_obs_posterior = self._bnn_post._prior_prec_obs
+        # prec_obs_posterior = dist.Delta(self._params["prec_obs_loc"]).mask(False) \
+        #     if "prec_obs_loc" in self._params.keys() else None
+        return w_posterior, prec_obs_posterior
 
 
 class BasicHMCExperiment(Experiment):
