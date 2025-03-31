@@ -7,6 +7,7 @@ __all__ = [
     "AutoDeltaVIExperiment",
     "AutoMeanFieldNormalVIExperiment",
     "BasicMeanFieldGaussianVIExperiment",
+    "InvGammaObservedMeanFieldGaussianVIExperiment",
     "BasicFullRankGaussianVIExperiment",
     "AutoFullRankLaplaceExperiment",
     "AutoFullRankLaplaceExperiment2",
@@ -84,6 +85,8 @@ class Experiment(ABC):
                 Y_scale = self._predictions["sigma_obs"]
                 assert jnp.all(Y_scale[0] == Y_scale)
                 Y_scale = Y_scale[0]
+            elif self._bnn.OBS_MODEL == "inv_gamma":
+                Y_scale = self._predictions["sigma_obs"][:, jnp.newaxis, jnp.newaxis]
             else:
                 Y_scale = self._predictions["Y_scale"]
             z = np.random.randn(*(jnp.shape(Y_mean_pred)[:-1] + (num_extend_samples,)))
@@ -613,6 +616,38 @@ class BasicMeanFieldGaussianVIExperiment(BasicVIExperiment):
         # initialise the delta guide to this point!
         prec_obs_posterior = dist.Delta(self._params["prec_obs_loc"]).mask(False) \
             if "prec_obs_loc" in self._params.keys() else None
+        return w_posterior, prec_obs_posterior
+
+
+class InvGammaObservedMeanFieldGaussianVIExperiment(BasicVIExperiment):
+    def _get_guide(self) -> Callable[[jnp.ndarray, Optional[jnp.ndarray]], Any]:
+        bnn_weight_dim = self._bnn.get_weight_dim()
+        bnn_weight_prior = self._bnn.prior[0]
+
+        def guide(X, Y=None):
+            w_loc = numpyro.param("w_loc", lambda rng_key: bnn_weight_prior.sample(rng_key))
+            w_scale = numpyro.param("w_scale", jnp.full((bnn_weight_dim,), 1e-5),
+                                    constraint=constraints.softplus_positive)
+            with handlers.scale(scale=self._bnn.BETA):
+                numpyro.sample("w", dist.Normal(w_loc, w_scale).to_event(1))
+            _, prec_obs_prior = self._bnn.prior
+            assert isinstance(prec_obs_prior, dist.Gamma), "Expecting Inverse Gaussian observation variance"
+            # Model posterior observation variance as an independent inverse Gamma again (initialized to prior)
+            prec_obs_concentration = numpyro.param("prec_obs_concentration", prec_obs_prior.concentration,
+                                                   constraint=constraints.positive)
+            prec_obs_rate = numpyro.param("prec_obs_rate", prec_obs_prior.rate,
+                                          constraint=constraints.positive)
+            prec_obs_dist = dist.Gamma(prec_obs_concentration, prec_obs_rate)
+            numpyro.sample("prec_obs", prec_obs_dist)
+
+        return guide
+
+    @property
+    def posterior(self) -> tuple[dist.Distribution, Optional[dist.Distribution]]:
+        assert self._params is not None
+        w_posterior = dist.Normal(loc=self._params["w_loc"], scale=self._params["w_scale"]).to_event(1)
+        prec_obs_posterior = dist.Gamma(concentration=self._params["prec_obs_concentration"],
+                                        rate=self._params["prec_obs_rate"])
         return w_posterior, prec_obs_posterior
 
 

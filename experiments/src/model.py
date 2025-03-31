@@ -56,10 +56,11 @@ class BNNRegressor(BayesianNeuralNetwork):
             self.OBS_MODEL = "loc_scale"
             self.D_Y += 1
             assert self.D_Y == 2
-        elif obs_model == "inv_gamma":
+        elif isinstance(obs_model, tuple) and obs_model[0] == "inv_gamma":
             self.OBS_MODEL = "inv_gamma"
             # self._prior_prec_obs = dist.Gamma(3.0, 1.0)
-            self._prior_prec_obs = dist.Gamma(1.0, 0.025)
+            # self._prior_prec_obs = dist.Gamma(1.0, 0.025)
+            self._prior_prec_obs = dist.Gamma(obs_model[1], obs_model[2])
         elif obs_model == "classification":
             self.OBS_MODEL = "classification"
         elif isinstance(obs_model, float):
@@ -234,3 +235,36 @@ class BayesianLinearRegression(BNNRegressor):
         weights = jnp.array([self._wi_from_flat(w, 0) for w in w_samples])
         bias = jnp.array([self._wi_from_flat(w, 0, bias=True) for w in w_samples])
         return weights.squeeze(), bias.squeeze()
+
+
+class DummyBNN(BayesianNeuralNetwork):
+    def __init__(self, beta=1.0):
+        super().__init__(beta=beta)
+        self.OBS_MODEL = "inv_gamma"
+
+    def __call__(self, X: jax.Array, Y: Optional[jax.Array] = None) -> None:
+        N, D_X = X.shape
+        w = numpyro.sample("w", dist.Normal(jnp.zeros((1, 1))))
+        pre_activ = jnp.full((*X.shape[:-1], 1), w)
+
+        # we put a prior on the observation noise
+        prec_obs = numpyro.sample("prec_obs", dist.Gamma(10., 0.0225))
+        sigma_obs = numpyro.deterministic("sigma_obs", 1.0 / jnp.sqrt(prec_obs))
+
+        Y_mean = numpyro.deterministic("Y_mean", pre_activ)
+        if Y is not None:
+            assert Y_mean.shape == Y.shape
+
+        # observe data
+        with numpyro.plate("data", N):
+            numpyro.sample("Y", dist.Normal(Y_mean, jnp.full_like(Y_mean, sigma_obs)).to_event(1), obs=Y)
+
+    def get_weight_dim(self) -> int:
+        return 1
+
+    @property
+    def prior(self) -> tuple[dist.Distribution, Optional[dist.Distribution]]:
+        raise NotImplementedError()
+
+    def with_prior(self, prior_w: dist.Distribution):
+        raise NotImplementedError()

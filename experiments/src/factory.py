@@ -1,4 +1,12 @@
 # This file contains default factories, setting appropriate tuned hyperparameters for different algorithms
+__all__ = [
+    "small",
+    "big",
+    "small_inv_gamma",
+    "big_inv_gamma",
+    "small_fixed_prec",
+    "big_fixed_prec",
+]
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -257,4 +265,128 @@ class big(factory):
             max_iter=40_000,
             lr_schedule=optax.piecewise_constant_schedule(-0.001, {25_000: 0.5, 50_000: 0.5}),
             num_particles=1, num_eval_particles=16,
+        )
+
+
+class inv_gamma_mixin:
+    """Mixin to configure BNN with inverse Gamma observation model."""
+    @classmethod
+    def hmc(cls, bnn: BNNRegressor, data: Data, trained_map_experiments: list[AutoDeltaVIExperiment]) -> BasicHMCExperiment:
+        assert len(trained_map_experiments) == cls.HMC_NUM_CHAINS
+        init_params = jnp.array([delta._params["w_loc"] for delta in trained_map_experiments])
+        init_prec_obs = jnp.full((len(trained_map_experiments),), bnn.prior[1].mean)
+        return BasicHMCExperiment(
+            bnn, data,
+            init_params={"w": init_params, "prec_obs": init_prec_obs},
+            num_warmup=50, num_samples=150,
+            num_chains=cls.HMC_NUM_CHAINS
+        )
+
+    @classmethod
+    def sgld(cls, bnn: BNNRegressor, data: Data, trained_map_experiments: list[AutoDeltaVIExperiment], step_size=5e-7) -> BasicSGLDExperiment:
+        assert len(trained_map_experiments) == cls.HMC_NUM_CHAINS
+        init_params = jnp.array([delta._params["w_loc"] for delta in trained_map_experiments])
+        init_prec_obs = jnp.full((len(trained_map_experiments),), bnn.prior[1].mean)
+        return BasicSGLDExperiment(
+            bnn, data,
+            init_params={"w": init_params, "prec_obs": init_prec_obs},
+            init_step_size=2*step_size,
+            final_step_size=step_size,
+            thinning=250,
+            num_warmup=50_000,
+            num_samples=100_000,
+            num_chains=cls.HMC_NUM_CHAINS,
+        )
+
+
+    @classmethod
+    def _override_bnn(cls, original_bnn: BNNRegressor) -> BNNRegressor:
+        return BNNRegressor(
+            nonlin=original_bnn._nonlin,
+            D_X=original_bnn.D_X,
+            D_Y=original_bnn.D_Y-1,
+            D_H=original_bnn.D_H,
+            biases=original_bnn._biases,
+            obs_model=("inv_gamma", 10., 0.0225),  # High confidence
+            prior_scale=np.sqrt(2),
+            prior_type = "xavier",
+            beta=original_bnn.BETA,
+            scale_nonlin=original_bnn._scale_nonlin,
+        )
+
+
+class small_inv_gamma(inv_gamma_mixin, small):
+    @classmethod
+    def bnn(cls) -> BNNRegressor:
+        return cls._override_bnn(super().bnn())
+
+    @classmethod
+    def mfvi(cls, bnn: BNNRegressor, data: Data) -> InvGammaObservedMeanFieldGaussianVIExperiment:
+        return InvGammaObservedMeanFieldGaussianVIExperiment(
+            bnn, data, num_samples=400,
+            max_iter=75_000,
+            lr_schedule=optax.piecewise_constant_schedule(-0.001, {25_000: 0.5, 50_000: 0.5}),
+            num_particles=16, num_eval_particles=128,
+        )
+
+
+class big_inv_gamma(inv_gamma_mixin, big):
+    @classmethod
+    def bnn(cls) -> BNNRegressor:
+        return cls._override_bnn(super().bnn())
+
+    @classmethod
+    def mfvi(cls, bnn: BNNRegressor, data: Data) -> InvGammaObservedMeanFieldGaussianVIExperiment:
+        return InvGammaObservedMeanFieldGaussianVIExperiment(
+            bnn, data, num_samples=400,
+            max_iter=40_000,
+            lr_schedule=optax.piecewise_constant_schedule(-0.001, {25_000: 0.5, 50_000: 0.5}),
+            num_particles=1, num_eval_particles=16,
+        )
+
+
+class small_fixed_prec(small):
+    @classmethod
+    def bnn(cls) -> BNNRegressor:
+        original_bnn = super().bnn()
+        return BNNRegressor(
+            nonlin=original_bnn._nonlin,
+            D_X=original_bnn.D_X,
+            D_Y=original_bnn.D_Y-1,
+            D_H=original_bnn.D_H,
+            biases=original_bnn._biases,
+            obs_model=25.,  # Override to const precision
+            prior_scale=np.sqrt(2),
+            prior_type="xavier",
+            beta=1.0,
+            scale_nonlin=lambda xs: jax.nn.softplus(xs) * 0.2 + 1e-2,
+        )
+
+
+class big_fixed_prec(big):
+    @classmethod
+    def bnn(cls) -> BNNRegressor:
+        original_bnn = super().bnn()
+        return BNNRegressor(
+            nonlin=original_bnn._nonlin,
+            D_X=original_bnn.D_X,
+            D_Y=original_bnn.D_Y-1,
+            D_H=original_bnn.D_H,
+            biases=original_bnn._biases,
+            obs_model=25.,  # Override to const precision
+            prior_scale=np.sqrt(2),
+            prior_type="xavier",
+            beta=1.0,
+            scale_nonlin=lambda xs: jax.nn.softplus(xs) * 0.2 + 1e-2,
+        )
+
+    @classmethod
+    def hmc(cls, bnn: BNNRegressor, data: Data, trained_map_experiments: list[AutoDeltaVIExperiment]) -> BasicHMCExperiment:
+        assert len(trained_map_experiments) == cls.HMC_NUM_CHAINS
+        init_params = jnp.array([delta._params["w_loc"] for delta in trained_map_experiments])
+        return BasicHMCExperiment(
+            bnn, data,
+            init_params={"w": init_params},
+            num_warmup=10, num_samples=800,
+            num_chains=cls.HMC_NUM_CHAINS
         )

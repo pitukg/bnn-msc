@@ -16,7 +16,7 @@ numpyro.set_platform(DEVICE)
 
 # Plotting
 plt.rcParams.update({
-    "axes.grid": True,  # show grid by default
+    "axes.grid": False,  # show grid by default
     "axes.titlesize": 20,
     "axes.titlepad": 10.0,
     "axes.labelsize": 18,
@@ -32,15 +32,21 @@ plt.rcParams.update({
     "lines.color": "k",  # black lines
     # "grid.color": "0.5",    # gray gridlines
     "grid.linestyle": "-",  # solid gridlines
-    "grid.linewidth": 0.3,  # thin gridlines
+    "grid.linewidth": 0.1,  # thin gridlines
+    "grid.alpha": 0.3,
+    # "grid.rasterized": True,
     "savefig.dpi": 300,  # higher resolution output.
+    # Set Helvetica as the default font
+    "pdf.use14corefonts": True,  # Ensures Type 1 fonts (including Helvetica) are used
+    "figure.figsize": [4, 3],
+    "axes.unicode_minus": False,
 })
 
 
 parser = argparse.ArgumentParser(
                     prog='SequentialUpdating',
                     description='Sequential updating experiment')
-parser.add_argument('--factory', choices=['big', 'small'])
+parser.add_argument('--factory', choices=dir(experiments.src.factory))
 parser.add_argument('--D_X', type=int)
 parser.add_argument('--block')
 args = parser.parse_args()
@@ -52,7 +58,7 @@ factory = getattr(experiments.src.factory, args.factory)
 #
 # axs = []
 
-fig, axs = plt.subplots(figsize=(18, 9), nrows=2, ncols=3, sharey='all')
+fig, axs = plt.subplots(figsize=(18, 9), nrows=2, ncols=3, sharey='all', sharex=True)
 axs = axs.ravel()
 
 # for i in range(0, 5):
@@ -89,8 +95,8 @@ for i in range(NSTEPS):
     e = Block(bnn, DataSlice(data, slice(curr, curr + by)))
     e.train(random.PRNGKey(0))
     e.make_predictions(random.PRNGKey(1))
-    e.make_plots(fig=fig, ax=axs[i], plot_samples=True)
-    axs[i].plot(data.train[0][:curr, 1], data.train[1][:curr], "x", color="#50190A", alpha=0.7,
+    e.make_plots(fig=fig, ax=axs[i], plot_samples=True, xlabel=i>2, ylabel=(i%3)==0)
+    axs[i].plot(data.train[0][:curr, 1], data.train[1][:curr], "x", color="#C14028", alpha=0.8,
                 label="Previously seen data points")
     axs[i].set_ylim(-6, 6)
     axs[i].set_title(f"Data points {curr}-{curr+by}")
@@ -106,12 +112,12 @@ for i in range(NSTEPS):
         hmc: BasicHMCExperiment = factory.map_then_hmc(bnn, e._data)
         hmc.train(random.PRNGKey(0))
         hmc.make_predictions(random.PRNGKey(1))
-        hmc.make_plots(fig=fig, ax=axs[-1], plot_samples=True)
-        axs[-1].plot(data.train[0][:curr, 1], data.train[1][:curr], "x", color="#50190A", alpha=0.7)
+        hmc.make_plots(fig=fig, ax=axs[-1], plot_samples=True, ylabel=False)
+        axs[-1].plot(data.train[0][:curr, 1], data.train[1][:curr], "x", color="#C14028", alpha=0.8)
         axs[-1].set_ylim(-6, 6)
         axs[-1].set_title(f"HMC on data points {curr}-{curr+by}")
 
-    bnn = bnn.with_prior(e.posterior[0])
+    bnn = bnn.with_prior(*e.posterior)
     curr += by
 
 fig.savefig(f"figs/sequential_{args.block}_{args.factory}_{args.D_X}.pdf")
