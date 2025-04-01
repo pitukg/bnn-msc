@@ -905,6 +905,10 @@ class AutoFullRankLaplaceExperiment2(AutoDiagonalLaplaceExperiment):
         loc = self._map_experiment._params["w_loc"]
         self._posterior = dist.MultivariateNormal(loc, cov)
 
+    @property
+    def posterior(self) -> tuple[dist.Distribution, Optional[dist.Distribution]]:
+        return self._posterior, self._bnn_post._prior_prec_obs
+
 
 class SWAGExperiment(SequentialExperimentBlock):
     def __init__(self, bnn: BayesianNeuralNetwork, data: Data, trained_map_experiment: AutoDeltaVIExperiment,

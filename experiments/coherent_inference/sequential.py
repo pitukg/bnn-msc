@@ -81,8 +81,18 @@ axs = axs.ravel()
 #     axs.append(ax)
 
 # Data & model
-factory.D_X = args.D_X
-data = ToyData1(feat_D_X=args.D_X, train_size=100)
+# factory.D_X = args.D_X
+from experiments.src.data import GPData
+# Example usage
+data = GPData(
+    length_scale=1.0,
+    sigma_obs=0.15,
+    train_size=100,
+    test_size=500,
+    rff_full_features=20,
+    rff_features=20
+)
+# data = ToyData1(feat_D_X=args.D_X, train_size=100)
 bnn = factory.bnn()
 if args.block == "mfvi":
     bnn.BETA = factory.BETA
@@ -98,7 +108,7 @@ for i in range(NSTEPS):
     e.make_plots(fig=fig, ax=axs[i], plot_samples=True, xlabel=i>2, ylabel=(i%3)==0)
     axs[i].plot(data.train[0][:curr, 1], data.train[1][:curr], "x", color="#C14028", alpha=0.8,
                 label="Previously seen data points")
-    axs[i].set_ylim(-6, 6)
+    # axs[i].set_ylim(-6, 6)
     axs[i].set_title(f"Data points {curr}-{curr+by}")
     if i == 2:
         # Plot legend
@@ -114,7 +124,7 @@ for i in range(NSTEPS):
         hmc.make_predictions(random.PRNGKey(1))
         hmc.make_plots(fig=fig, ax=axs[-1], plot_samples=True, ylabel=False)
         axs[-1].plot(data.train[0][:curr, 1], data.train[1][:curr], "x", color="#C14028", alpha=0.8)
-        axs[-1].set_ylim(-6, 6)
+        # axs[-1].set_ylim(-6, 6)
         axs[-1].set_title(f"HMC on data points {curr}-{curr+by}")
 
     bnn = bnn.with_prior(*e.posterior)

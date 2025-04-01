@@ -15,7 +15,7 @@ from typing import List
 
 from jax import random
 
-from .model import BNNRegressor
+from .model import BayesianLinearRegression, BNNRegressor
 from .data import Data
 from .experiment import *
 
@@ -390,3 +390,120 @@ class big_fixed_prec(big):
             num_warmup=10, num_samples=800,
             num_chains=cls.HMC_NUM_CHAINS
         )
+
+
+class tractable(factory):
+    @classmethod
+    def bnn(cls) -> BayesianLinearRegression:
+        return BayesianLinearRegression(
+            input_dim=20,
+            noise_scale=0.15,
+            prior_scale=1,
+        )
+
+    @classmethod
+    def true(cls, blr: BayesianLinearRegression, data: Data) -> TrueBayesianLinearRegressionExperiment:
+        return TrueBayesianLinearRegressionExperiment(blr, data)
+
+    BETA = 1.0
+
+    @classmethod
+    def mfvi(cls, blr: BayesianLinearRegression, data: Data) -> BasicMeanFieldGaussianVIExperiment:
+        return BasicMeanFieldGaussianVIExperiment(
+            blr, data, num_samples=400,
+            max_iter=200_000,
+            lr_schedule=optax.piecewise_constant_schedule(-0.0001, {40_000: 0.5, 80_000: 0.5}),
+            num_particles=64, num_eval_particles=1,
+            init_scale=1e-2,
+        )
+
+    @classmethod
+    def fullrank_vi(cls, blr: BayesianLinearRegression, data: Data) -> BasicFullRankGaussianVIExperiment:
+        return BasicFullRankGaussianVIExperiment(
+            blr, data, num_samples=400,
+            max_iter=400_000,
+            lr_schedule=optax.piecewise_constant_schedule(-0.0001, {75_000: 0.5, 150_000: 0.5}),
+            num_particles=1, num_eval_particles=1,
+        )
+
+    @classmethod
+    def map(cls, blr: BayesianLinearRegression, data: Data) -> AutoDeltaVIExperiment:
+        return AutoDeltaVIExperiment(
+            blr, data, max_iter=150_000,
+            lr_schedule=optax.piecewise_constant_schedule(
+                -0.0001, {50_000: 0.5}
+            ),
+        )
+
+    @classmethod
+    def hmc(cls, bnn: BNNRegressor, data: Data, trained_map_experiments: list[AutoDeltaVIExperiment]) -> BasicHMCExperiment:
+        assert len(trained_map_experiments) == cls.HMC_NUM_CHAINS
+        init_params = jnp.array([delta._params["w_loc"] for delta in trained_map_experiments])
+        return BasicHMCExperiment(
+            bnn, data,
+            init_params={"w": init_params},
+            num_warmup=50, num_samples=400,
+            num_chains=cls.HMC_NUM_CHAINS
+        )
+
+    @classmethod
+    def map_then_hmc(cls, bnn: BNNRegressor, data: Data) -> BasicHMCExperiment:
+        return super().map_then_hmc(bnn, data)
+
+    @classmethod
+    def sgld(cls, blr: BNNRegressor, data: Data, trained_map_experiments: list[AutoDeltaVIExperiment], step_size=1e-5) -> BasicSGLDExperiment:
+        assert len(trained_map_experiments) == cls.HMC_NUM_CHAINS
+        init_params = jnp.array([delta._params["w_loc"] for delta in trained_map_experiments])
+        return BasicSGLDExperiment(
+            blr, data,
+            init_params={"w": init_params},
+            init_step_size=2*1e-6,
+            final_step_size=8*1e-7,
+            thinning=250,
+            num_warmup=50_000,
+            num_samples=250_000,
+            num_chains=cls.HMC_NUM_CHAINS,
+        )
+
+    @classmethod
+    def diag_laplace(cls, blr: BayesianLinearRegression, data: Data, trained_map_experiment: AutoDeltaVIExperiment) -> AutoDiagonalLaplaceExperiment:
+        return AutoDiagonalLaplaceExperiment(
+            blr, data,
+            trained_map_experiment=trained_map_experiment,
+            # num_samples=400,
+            # max_iter=40_000,
+            # lr_schedule=optax.piecewise_constant_schedule(-0.0001, {75_000: 0.5, 150_000: 0.5}),
+            # num_particles=16, num_eval_particles=1,
+            shrink=0.,
+        )
+
+    @classmethod
+    def map_then_diag_laplace(cls, bnn: BNNRegressor, data: Data) -> AutoDiagonalLaplaceExperiment:
+        return super().map_then_diag_laplace(bnn, data)
+
+    @classmethod
+    def fullrank_laplace(cls, blr: BayesianLinearRegression, data: Data, trained_map_experiment: AutoDeltaVIExperiment) -> AutoFullRankLaplaceExperiment2:
+        return AutoFullRankLaplaceExperiment2(
+            blr, data,
+            trained_map_experiment=trained_map_experiment,
+            # num_samples=400,
+            # max_iter=40_000,
+            # lr_schedule=optax.piecewise_constant_schedule(-0.0001, {75_000: 0.5, 150_000: 0.5}),
+            # num_particles=16, num_eval_particles=1,
+            shrink=0,
+        )
+
+    @classmethod
+    def map_then_fullrank_laplace(cls, bnn: BNNRegressor, data: Data) -> AutoDiagonalLaplaceExperiment:
+        print(cls.__name__)
+        delta = cls.map(bnn, data)
+        delta.train(random.PRNGKey(0))
+        return cls.fullrank_laplace(bnn, data, delta)
+
+    @classmethod
+    def swag(cls, bnn: BNNRegressor, data: Data, trained_map_experiment: AutoDeltaVIExperiment) -> SWAGExperiment:
+        raise NotImplementedError
+
+    @classmethod
+    def map_then_swag(cls, bnn: BNNRegressor, data: Data) -> SWAGExperiment:
+        raise NotImplementedError
